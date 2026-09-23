@@ -48,11 +48,27 @@ pub struct Window {
 pub struct WindowLayout {
     #[serde(rename = "tile_pos_in_workspace_view")]
     pub tile_pos: Option<[f64; 2]>,
+    #[serde(default, rename = "tile_size")]
+    pub tile_size: Option<[f64; 2]>,
     #[serde(rename = "window_size")]
     pub window_size: Option<[u32; 2]>,
     /// Position in scrolling layout: (column index, tile index in column), 1-based
     #[serde(rename = "pos_in_scrolling_layout")]
     pub pos_in_scrolling_layout: Option<(usize, usize)>,
+}
+
+impl WindowLayout {
+    pub fn effective_width(&self) -> f64 {
+        let ws = self.window_size.map(|s| s[0] as f64).unwrap_or(0.0);
+        let ts = self.tile_size.map(|s| s[0]).unwrap_or(0.0);
+        ws.max(ts)
+    }
+
+    pub fn effective_height(&self) -> f64 {
+        let ws = self.window_size.map(|s| s[1] as f64).unwrap_or(0.0);
+        let ts = self.tile_size.map(|s| s[1]).unwrap_or(0.0);
+        ws.max(ts)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +229,7 @@ impl NiriIpc {
                         output: None,
                         layout: Some(WindowLayout {
                             tile_pos: w.layout.tile_pos_in_workspace_view.map(|(x, y)| [x, y]),
+                            tile_size: Some([w.layout.tile_size.0, w.layout.tile_size.1]),
                             window_size: Some([
                                 w.layout.window_size.0 as u32,
                                 w.layout.window_size.1 as u32,
@@ -256,6 +273,7 @@ impl NiriIpc {
                             output: None,
                             layout: Some(WindowLayout {
                                 tile_pos: w.layout.tile_pos_in_workspace_view.map(|(x, y)| [x, y]),
+                                tile_size: Some([w.layout.tile_size.0, w.layout.tile_size.1]),
                                 window_size: Some([
                                     w.layout.window_size.0 as u32,
                                     w.layout.window_size.1 as u32,
@@ -299,6 +317,10 @@ impl NiriIpc {
             output: None, // niri_ipc::Window doesn't have output field directly
             layout: Some(WindowLayout {
                 tile_pos: niri_window.layout.tile_pos_in_workspace_view.map(|(x, y)| [x, y]),
+                tile_size: Some([
+                    niri_window.layout.tile_size.0,
+                    niri_window.layout.tile_size.1,
+                ]),
                 window_size: Some([
                     niri_window.layout.window_size.0 as u32,
                     niri_window.layout.window_size.1 as u32,
@@ -526,6 +548,50 @@ impl NiriIpc {
         .await
     }
 
+    /// Apply optional width and height settings to a floating window.
+    /// An explicit height takes precedence over resetting the height to automatic.
+    pub async fn set_floating_window_size(
+        &self,
+        window_id: u64,
+        width: Option<u32>,
+        height: Option<u32>,
+        reset_height: bool,
+    ) -> Result<()> {
+        if let Some(width) = width {
+            let width = i32::try_from(width).context("Floating window width exceeds i32::MAX")?;
+            self.send_action(Action::SetWindowWidth {
+                id: Some(window_id),
+                change: SizeChange::SetFixed(width),
+            })
+            .await?;
+        }
+
+        if let Some(height) = height {
+            let height =
+                i32::try_from(height).context("Floating window height exceeds i32::MAX")?;
+            self.send_action(Action::SetWindowHeight {
+                id: Some(window_id),
+                change: SizeChange::SetFixed(height),
+            })
+            .await?;
+        } else if reset_height {
+            self.send_action(Action::ResetWindowHeight {
+                id: Some(window_id),
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Center a window on its output without changing focus.
+    pub async fn center_window(&self, window_id: u64) -> Result<()> {
+        self.send_action(Action::CenterWindow {
+            id: Some(window_id),
+        })
+        .await
+    }
+
     /// Get output dimensions (width and height) for focused output
     pub async fn get_output_size(&self) -> Result<(u32, u32)> {
         let output = self.get_focused_output().await?;
@@ -567,7 +633,7 @@ impl NiriIpc {
     }
     /// Returns (x, y, width, height) if available
     /// For floating windows, extracts position from layout.tile_pos_in_workspace_view
-    /// and size from layout.window_size
+    /// and size from layout.effective_width() and layout.effective_height()
     pub async fn get_window_position(
         &self,
         window_id: u64,
@@ -579,13 +645,17 @@ impl NiriIpc {
                 // For floating windows, get position from layout
                 if window.floating {
                     if let Some(layout) = &window.layout {
-                        if let (Some(pos), Some(size)) = (layout.tile_pos, layout.window_size) {
-                            return Ok(Some((
-                                pos[0] as i32, // x
-                                pos[1] as i32, // y
-                                size[0],       // width
-                                size[1],       // height
-                            )));
+                        if let Some(pos) = layout.tile_pos {
+                            let width = layout.effective_width().round() as u32;
+                            let height = layout.effective_height().round() as u32;
+                            if width > 0 && height > 0 {
+                                return Ok(Some((
+                                    pos[0] as i32, // x
+                                    pos[1] as i32, // y
+                                    width,
+                                    height,
+                                )));
+                            }
                         }
                     }
                 }

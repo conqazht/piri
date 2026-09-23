@@ -52,7 +52,7 @@ mkdir -p "$CONFIG_DIR"
 # 复制二进制文件
 echo -e "${GREEN}安装二进制文件...${NC}"
 if [ -f "target/release/piri" ]; then
-    sudo rm -f "$BIN_DIR/piri"
+    rm -f "$BIN_DIR/piri" 2>/dev/null || sudo rm -f "$BIN_DIR/piri"
     cp target/release/piri "$BIN_DIR/piri"
     chmod +x "$BIN_DIR/piri"
     echo -e "${GREEN}✓ 二进制文件已安装到 $BIN_DIR/piri${NC}"

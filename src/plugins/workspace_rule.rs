@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use log::{debug, info, warn};
-use niri_ipc::{Action, Reply, Request, SizeChange};
+use niri_ipc::{Action, Request, SizeChange};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::time::Duration;
 
-use crate::config::{Config, EdgePulseConfig, WorkspaceRuleConfig, WorkspaceRuleSection};
+use crate::config::{
+    Config, EdgePulseConfig, WindowRuleConfig, WorkspaceRuleConfig, WorkspaceRuleSection,
+};
 use crate::niri::NiriIpc;
 use crate::plugins::edge_pulse_renderer::{EdgePulseRenderState, EdgePulseRenderer};
 use crate::plugins::resolve_workspace_config;
-use crate::plugins::window_utils::perform_swallow;
+use crate::plugins::window_utils::{perform_swallow, WindowMatcher, WindowMatcherCache};
 use crate::plugins::FromConfig;
-use crate::utils::Throttle;
 use niri_ipc::ColumnDisplay;
 
 struct AutofillGuard {
@@ -38,6 +39,10 @@ impl Drop for AutofillGuard {
 pub struct WorkspaceRulePluginConfig {
     pub default: WorkspaceRuleSection,
     pub workspaces: HashMap<String, WorkspaceRuleConfig>,
+    /// Window rules that move windows to the floating layer (mirrored so
+    /// tiling adjustments can skip panels that are about to become floating)
+    #[serde(default)]
+    pub floating_rules: Vec<WindowRuleConfig>,
 }
 
 impl FromConfig for WorkspaceRulePluginConfig {
@@ -61,6 +66,12 @@ impl FromConfig for WorkspaceRulePluginConfig {
         Some(Self {
             default: config.piri.workspace_rule.clone(),
             workspaces: config.workspace_rule.clone(),
+            floating_rules: config
+                .window_rule
+                .iter()
+                .filter(|r| r.floating == Some(true))
+                .cloned()
+                .collect(),
         })
     }
 }
@@ -73,13 +84,32 @@ pub struct WorkspaceRulePlugin {
     maximized_windows: HashSet<u64>,
     auto_tiled_windows: HashSet<u64>,
     previous_window_sizes: HashMap<u64, (i32, i32)>,
-    apply_widths_throttle: Arc<StdMutex<Throttle>>,
     autofill_executing: Arc<StdMutex<bool>>,
     edge_pulse_last_render: Option<EdgePulseRenderState>,
     edge_pulse_renderer: EdgePulseRenderer,
+    /// Regex cache for matching windows against floating rules
+    matcher_cache: Arc<WindowMatcherCache>,
+    /// Tracks column positions of tiled windows: window_id -> (workspace_id, col_idx)
+    window_columns: HashMap<u64, (u64, usize)>,
 }
 
 impl WorkspaceRulePlugin {
+    /// Check whether a window matches a floating window rule (i.e. the
+    /// window_rule plugin is about to move it to the floating layer).
+    fn matches_floating_rule(&self, window: &niri_ipc::Window) -> Result<bool> {
+        for rule in &self.config.floating_rules {
+            let matcher = WindowMatcher::new(rule.app_id.as_deref(), rule.title.as_deref());
+            if self.matcher_cache.matches(
+                window.app_id.as_ref(),
+                window.title.as_ref(),
+                &matcher,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn hide_edge_pulse(&mut self) -> Result<()> {
         let hidden = EdgePulseRenderState {
             show_left: false,
@@ -123,9 +153,29 @@ impl WorkspaceRulePlugin {
         name: Option<&str>,
         output: Option<&str>,
         reason: &str,
+        target_focus: Option<u64>,
+        align_right: bool,
     ) -> Result<()> {
         if !self.get_auto_fill(idx, name, output) {
+            if let Some(target_id) = target_focus {
+                let _ = self.niri.focus_window(target_id).await;
+            }
             return Ok(());
+        }
+
+        // Never yank focus while the user works in a floating window (e.g.
+        // typing a master password into a panel): the align dance (focus
+        // first column, then refocus) would steal it mid-typing.
+        if let Ok(Some(focused_id)) = self.niri.get_focused_window_id().await {
+            if let Ok(windows) = self.niri.get_windows_raw().await {
+                if windows.iter().any(|w| w.id == focused_id && w.floating) {
+                    debug!(
+                        "Autofill skipped: focused window {} is floating",
+                        focused_id
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         {
@@ -141,7 +191,7 @@ impl WorkspaceRulePlugin {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        self.check_and_align_last_column()
+        self.check_and_align_last_column(target_focus, align_right)
             .await
             .map_err(|e| {
                 warn!("Auto_fill: failed to align columns: {}", e);
@@ -558,78 +608,123 @@ impl WorkspaceRulePlugin {
         Ok(())
     }
 
-    async fn check_and_align_last_column(&self) -> Result<()> {
-        debug!("Autofill: aligning columns in current workspace");
+    async fn check_and_align_last_column(
+        &self,
+        target_focus: Option<u64>,
+        align_right: bool,
+    ) -> Result<()> {
+        debug!(
+            "Autofill: aligning columns in current workspace (align_right={}, target_focus={:?})",
+            align_right, target_focus
+        );
 
         crate::plugins::window_utils::mark_programmatic_focus_start();
 
         let _guard = AutofillGuard::new(Arc::clone(&self.autofill_executing));
 
         self.niri
-            .execute_batch(|socket| {
-                let focused_window_id =
-                    socket.send(Request::FocusedWindow).ok().and_then(|reply| match reply {
-                        Reply::Ok(niri_ipc::Response::FocusedWindow(Some(w))) => Some(w.id),
-                        _ => None,
-                    });
-
-                let _ = socket.send(Request::Action(Action::FocusColumnFirst {}))?;
-
-                let action = if let Some(window_id) = focused_window_id {
-                    Action::FocusWindow { id: window_id }
-                } else {
-                    Action::FocusColumnLast {}
-                };
-                let _ = socket.send(Request::Action(action))?;
+            .execute_batch(move |socket| {
+                if align_right {
+                    let _ = socket.send(Request::Action(Action::FocusColumnLeft {}))?;
+                    let _ = socket.send(Request::Action(Action::FocusColumnRight {}))?;
+                } else if let Some(target_id) = target_focus {
+                    let _ = socket.send(Request::Action(Action::FocusWindow { id: target_id }))?;
+                }
 
                 Ok(())
             })
             .await
     }
 
-    async fn schedule_apply_widths(&mut self) -> Result<()> {
-        let should_run = self
-            .apply_widths_throttle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .check_and_update_no_reset(Duration::from_millis(200));
-
-        if should_run {
-            self.apply_widths().await?;
-        }
-        Ok(())
-    }
-
     async fn on_window_opened(&mut self, window: &niri_ipc::Window) -> Result<()> {
-        let current_ws = self.niri.get_focused_workspace().await?;
-        let ws_idx = current_ws.idx;
-        let ws_name = &current_ws.name;
-        let ws_output = current_ws.output.as_deref();
-
         self.previous_window_sizes.insert(window.id, window.layout.window_size);
         self.window_floating_state.insert(window.id, window.is_floating);
+
+        let is_potential_floating_panel = !window.is_floating
+            && (self.matches_floating_rule(window)?
+                || (window.title.as_deref().is_none_or(str::is_empty)
+                    && self
+                        .config
+                        .floating_rules
+                        .iter()
+                        .any(|r| r.title.is_some() && r.app_id.is_none())));
+
+        if is_potential_floating_panel {
+            debug!(
+                "Window {} matches a floating rule (or is untitled potential panel), skipping tiling adjustments",
+                window.id
+            );
+            self.sync_edge_pulse_indicator(None).await?;
+            return Ok(());
+        }
 
         if window.is_floating {
             debug!("New floating window: {}", window.id);
         } else {
             debug!("New tiled window: {}", window.id);
             let windows = self.niri.get_windows_raw().await?;
+            for w in &windows {
+                if !w.floating {
+                    if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
+                        if let Some(pos) = layout.pos_in_scrolling_layout {
+                            self.window_columns.insert(w.id, (ws_id, pos.0));
+                        }
+                    }
+                }
+            }
+
             if let Some(full_window) = windows.iter().find(|w| w.id == window.id) {
                 let auto_tiled = self.handle_auto_tile(full_window).await.unwrap_or(false);
                 if auto_tiled {
                     self.auto_tiled_windows.insert(window.id);
                 }
-                if !auto_tiled {
-                    self.schedule_apply_widths().await?;
-                    self.try_execute_autofill(
-                        ws_idx,
-                        Some(ws_name.as_str()),
-                        ws_output,
-                        "window opened",
-                    )
-                    .await?;
-                } else {
-                    self.schedule_apply_widths().await?;
+            }
+
+            self.apply_widths().await?;
+
+            if let Some(ws_id) = window.workspace_id {
+                let current_ws = self.niri.get_focused_workspace().await?;
+                if current_ws.id == ws_id {
+                    let ws_idx = current_ws.idx;
+                    let ws_name = &current_ws.name;
+                    let ws_output = current_ws.output.as_deref();
+
+                    if self.get_auto_fill(ws_idx, Some(ws_name.as_str()), ws_output) {
+                        let ws_windows: Vec<_> = windows
+                            .iter()
+                            .filter(|w| !w.floating && w.workspace_id == Some(ws_id))
+                            .collect();
+
+                        let max_col = ws_windows
+                            .iter()
+                            .filter_map(|w| {
+                                w.layout
+                                    .as_ref()
+                                    .and_then(|l| l.pos_in_scrolling_layout)
+                                    .map(|p| p.0)
+                            })
+                            .max()
+                            .unwrap_or(0);
+
+                        let my_col =
+                            self.window_columns.get(&window.id).map(|(_, c)| *c).unwrap_or(0);
+
+                        if my_col == max_col && max_col > 1 {
+                            info!(
+                                "Auto_fill: new window {} is the last column ({}/{}), aligning right",
+                                window.id, my_col, max_col
+                            );
+                            self.try_execute_autofill(
+                                ws_idx,
+                                Some(ws_name.as_str()),
+                                ws_output,
+                                "new window in last column",
+                                None,
+                                true,
+                            )
+                            .await?;
+                        }
+                    }
                 }
             }
         }
@@ -638,37 +733,37 @@ impl WorkspaceRulePlugin {
         Ok(())
     }
 
-    async fn on_window_changed(&mut self, _window: &niri_ipc::Window) -> Result<()> {
+    async fn on_window_changed(&mut self, window: &niri_ipc::Window) -> Result<()> {
+        if !window.is_floating {
+            if let (Some(ws_id), Some(pos)) =
+                (window.workspace_id, window.layout.pos_in_scrolling_layout)
+            {
+                self.window_columns.insert(window.id, (ws_id, pos.0));
+            }
+        }
         self.sync_edge_pulse_indicator(None).await?;
         Ok(())
     }
 
     async fn on_window_toggle_floating(&mut self, window: &niri_ipc::Window) -> Result<()> {
         self.window_floating_state.insert(window.id, window.is_floating);
+        if window.is_floating {
+            self.window_columns.remove(&window.id);
+        } else if let (Some(ws_id), Some(pos)) =
+            (window.workspace_id, window.layout.pos_in_scrolling_layout)
+        {
+            self.window_columns.insert(window.id, (ws_id, pos.0));
+        }
 
-        let current_ws = self.niri.get_focused_workspace().await?;
-        let ws_idx = current_ws.idx;
-        let ws_name = &current_ws.name;
-        let ws_output = current_ws.output.as_deref();
-
-        self.schedule_apply_widths().await?;
+        self.apply_widths().await?;
 
         if !window.is_floating {
-            // Moved to tiled — try auto_tile and auto_fill
+            // Moved to tiled — try auto_tile
             let windows = self.niri.get_windows_raw().await?;
             if let Some(full_window) = windows.iter().find(|w| w.id == window.id) {
                 let auto_tiled = self.handle_auto_tile(full_window).await.unwrap_or(false);
                 if auto_tiled {
                     self.auto_tiled_windows.insert(window.id);
-                }
-                if !auto_tiled {
-                    self.try_execute_autofill(
-                        ws_idx,
-                        Some(ws_name.as_str()),
-                        ws_output,
-                        "window moved to tiled",
-                    )
-                    .await?;
                 }
             }
         }
@@ -679,20 +774,108 @@ impl WorkspaceRulePlugin {
 
     async fn handle_window_closed(&mut self, window_id: u64) -> Result<()> {
         self.previous_layouts.remove(&window_id);
-        self.window_floating_state.remove(&window_id);
+        let was_floating = self.window_floating_state.remove(&window_id).unwrap_or(false);
         self.maximized_windows.remove(&window_id);
         self.auto_tiled_windows.remove(&window_id);
         self.previous_window_sizes.remove(&window_id);
 
+        let closed_col_info = self.window_columns.remove(&window_id);
+
+        // A closed floating panel never took part in the tiling layout, so
+        // there is nothing to re-apply or realign (and the align dance would
+        // just yank focus for no reason).
+        if was_floating {
+            debug!(
+                "Closed window {} was floating, skipping tiling adjustments",
+                window_id
+            );
+            self.sync_edge_pulse_indicator(None).await?;
+            return Ok(());
+        }
+
         debug!("Window {} closed, applying width adjustments", window_id);
-        self.schedule_apply_widths().await?;
+        self.apply_widths().await?;
 
         let current_ws = self.niri.get_focused_workspace().await?;
         let ws_idx = current_ws.idx;
         let ws_name = &current_ws.name;
         let ws_output = current_ws.output.as_deref();
-        self.try_execute_autofill(ws_idx, Some(ws_name.as_str()), ws_output, "window closed")
-            .await?;
+
+        let remaining = self.niri.get_windows_raw().await.unwrap_or_default();
+        for w in &remaining {
+            if !w.floating {
+                if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
+                    if let Some(pos) = layout.pos_in_scrolling_layout {
+                        self.window_columns.insert(w.id, (ws_id, pos.0));
+                    }
+                }
+            }
+        }
+
+        let (target_focus, align_right) = if let Some((ws_id, closed_col)) = closed_col_info {
+            if ws_id != current_ws.id {
+                (None, false)
+            } else {
+                let mut ws_remaining: Vec<_> = remaining
+                    .iter()
+                    .filter(|w| !w.floating && w.workspace_id == Some(ws_id))
+                    .collect();
+
+                ws_remaining.sort_by_key(|w| {
+                    w.layout
+                        .as_ref()
+                        .and_then(|l| l.pos_in_scrolling_layout)
+                        .map(|p| p.0)
+                        .unwrap_or(usize::MAX)
+                });
+
+                let target_col = if closed_col > 1 { closed_col - 1 } else { 1 };
+                let target = ws_remaining
+                    .iter()
+                    .find(|w| {
+                        w.layout.as_ref().and_then(|l| l.pos_in_scrolling_layout).map(|p| p.0)
+                            == Some(target_col)
+                    })
+                    .or_else(|| ws_remaining.first())
+                    .map(|w| w.id);
+
+                let max_remaining_col = ws_remaining
+                    .iter()
+                    .filter_map(|w| {
+                        w.layout.as_ref().and_then(|l| l.pos_in_scrolling_layout).map(|p| p.0)
+                    })
+                    .max()
+                    .unwrap_or(0);
+
+                let was_last = closed_col > max_remaining_col && ws_remaining.len() > 1;
+
+                (target, was_last)
+            }
+        } else {
+            let mut ws_remaining: Vec<_> = remaining
+                .iter()
+                .filter(|w| !w.floating && w.workspace_id == Some(current_ws.id))
+                .collect();
+            ws_remaining.sort_by_key(|w| {
+                w.layout
+                    .as_ref()
+                    .and_then(|l| l.pos_in_scrolling_layout)
+                    .map(|p| p.0)
+                    .unwrap_or(usize::MAX)
+            });
+            let target = ws_remaining.first().map(|w| w.id);
+            (target, false)
+        };
+
+        self.try_execute_autofill(
+            ws_idx,
+            Some(ws_name.as_str()),
+            ws_output,
+            "window closed",
+            target_focus,
+            align_right,
+        )
+        .await?;
         self.sync_edge_pulse_indicator(None).await?;
 
         Ok(())
@@ -716,10 +899,11 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
             maximized_windows: HashSet::new(),
             auto_tiled_windows: HashSet::new(),
             previous_window_sizes: HashMap::new(),
-            apply_widths_throttle: Arc::new(StdMutex::new(Throttle::new())),
             autofill_executing: Arc::new(StdMutex::new(false)),
             edge_pulse_last_render: None,
             edge_pulse_renderer: EdgePulseRenderer::new(),
+            matcher_cache: Arc::new(WindowMatcherCache::new()),
+            window_columns: HashMap::new(),
         }
     }
 
@@ -728,6 +912,20 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
         event: &crate::plugins::PiriEvent,
         _niri: &NiriIpc,
     ) -> Result<()> {
+        if self.window_columns.is_empty() {
+            if let Ok(windows) = self.niri.get_windows_raw().await {
+                for w in windows {
+                    if !w.floating {
+                        if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
+                            if let Some(pos) = layout.pos_in_scrolling_layout {
+                                self.window_columns.insert(w.id, (ws_id, pos.0));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         match event {
             crate::plugins::PiriEvent::WindowOpened { window } => {
                 self.on_window_opened(window).await?;
@@ -746,7 +944,16 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
             }
             crate::plugins::PiriEvent::WindowLayoutsChanged { changes } => {
                 let current_ws = self.niri.get_focused_workspace().await?;
-                let ws_name = &current_ws.name;
+
+                for (win_id, layout) in changes {
+                    if let Some(pos) = layout.pos_in_scrolling_layout {
+                        if let Some(entry) = self.window_columns.get_mut(win_id) {
+                            entry.1 = pos.0;
+                        } else {
+                            self.window_columns.insert(*win_id, (current_ws.id, pos.0));
+                        }
+                    }
+                }
 
                 let has_size_change = changes.iter().any(|(win_id, layout)| {
                     let is_floating =
@@ -763,19 +970,23 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
                 });
 
                 if has_size_change {
-                    self.try_execute_autofill(
-                        current_ws.idx,
-                        Some(ws_name.as_str()),
-                        current_ws.output.as_deref(),
-                        "window resized",
-                    )
-                    .await?;
                     self.sync_edge_pulse_indicator(None).await?;
                 }
             }
             crate::plugins::PiriEvent::WorkspaceActivated { id, focused: true } => {
                 self.edge_pulse_last_render = None;
                 self.sync_edge_pulse_indicator(Some(*id)).await?;
+            }
+            crate::plugins::PiriEvent::WindowsChanged { windows } => {
+                for w in windows {
+                    if !w.is_floating {
+                        if let (Some(ws_id), Some(pos)) =
+                            (w.workspace_id, w.layout.pos_in_scrolling_layout)
+                        {
+                            self.window_columns.insert(w.id, (ws_id, pos.0));
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -792,12 +1003,14 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
                 | crate::plugins::PiriEvent::WindowFocusChanged { id: Some(_) }
                 | crate::plugins::PiriEvent::WorkspaceActivated { .. }
                 | crate::plugins::PiriEvent::WindowLayoutsChanged { .. }
+                | crate::plugins::PiriEvent::WindowsChanged { .. }
         )
     }
 
     async fn update_config(&mut self, config: WorkspaceRulePluginConfig) -> Result<()> {
         info!("Updating workspace rule plugin configuration");
         self.config = config;
+        self.matcher_cache.clear_cache();
         self.edge_pulse_last_render = None;
         self.edge_pulse_renderer.shutdown();
         Ok(())

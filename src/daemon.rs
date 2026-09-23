@@ -25,15 +25,28 @@ async fn start_config_watcher(
         h.config_path().clone()
     };
 
+    let config_file = config_path.clone();
+    // Watch the parent directory instead of the file itself: editors that
+    // save atomically (temp file + rename) replace the inode, which silently
+    // kills a watch placed directly on the file after the first event.
+    let watch_dir = match config_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            if event.kind.is_modify() {
-                let _ = tx.blocking_send(());
+            // Accept any event kind for the target file: atomic saves show
+            // up as create/remove rather than modify.
+            if event.paths.iter().any(|p| p.file_name() == config_file.file_name()) {
+                // try_send: never block the notify thread; bursts coalesce
+                // into a single debounced reload.
+                let _ = tx.try_send(());
             }
         }
     })?;
 
-    watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
+    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
 
     // Spawn a task to handle reload signals with debounce
     tokio::spawn(async move {

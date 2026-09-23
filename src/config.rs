@@ -234,8 +234,20 @@ pub struct WindowRuleConfig {
     /// Regex pattern(s) to match title (optional, can be a string or list of strings)
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub title: Option<Vec<String>>,
-    /// Workspace to move matching windows to (name or idx, optional if focus_command is specified)
+    /// Workspace to move matching windows to (name or idx, optional if another action is specified)
     pub open_on_workspace: Option<String>,
+    /// Whether to move the matching window to the floating or tiling layer
+    pub floating: Option<bool>,
+    /// Fixed width to apply after moving a window to the floating layer
+    pub floating_width: Option<u32>,
+    /// Fixed height to apply after moving a window to the floating layer
+    pub floating_height: Option<u32>,
+    /// Reset the height to automatic after moving a window to the floating layer
+    #[serde(default)]
+    pub floating_reset_height: bool,
+    /// Center the window after moving it to the floating layer
+    #[serde(default)]
+    pub floating_centered: bool,
     /// Command to execute when a matching window is focused (optional)
     pub focus_command: Option<String>,
     /// If true, focus_command will only execute on the first focus (default: false)
