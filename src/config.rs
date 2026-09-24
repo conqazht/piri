@@ -278,6 +278,9 @@ pub struct ScratchpadDefaults {
     /// Optional workspace to move scratchpads to when hidden
     #[serde(default)]
     pub move_to_workspace: Option<String>,
+    /// Tile scratchpad windows into scrolling columns when hidden in target workspace
+    #[serde(default)]
+    pub tile_in_target_workspace: bool,
 }
 
 fn default_size() -> String {
@@ -294,6 +297,7 @@ impl Default for ScratchpadDefaults {
             default_size: default_size(),
             default_margin: default_margin(),
             move_to_workspace: None,
+            tile_in_target_workspace: false,
         }
     }
 }
@@ -322,6 +326,12 @@ pub struct ScratchpadConfig {
     /// If true, when the scratchpad is visible and focused, toggle will refocus to the previous window
     #[serde(default)]
     pub refocus: bool,
+    /// Optional per-scratchpad target workspace to move to when hidden
+    #[serde(default)]
+    pub move_to_workspace: Option<String>,
+    /// Optional per-scratchpad override for tiling in target workspace
+    #[serde(default)]
+    pub tile_in_target_workspace: Option<bool>,
 }
 
 impl ScratchpadConfig {
@@ -643,6 +653,12 @@ impl TryFrom<toml::Table> for ScratchpadConfig {
 
         let refocus = table.get("refocus").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        let move_to_workspace =
+            table.get("move_to_workspace").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        let tile_in_target_workspace =
+            table.get("tile_in_target_workspace").and_then(|v| v.as_bool());
+
         if sticky && auto_hide_on_focus_loss {
             anyhow::bail!(
                 "'sticky' and 'auto_hide_on_focus_loss' cannot both be enabled for a scratchpad"
@@ -659,6 +675,8 @@ impl TryFrom<toml::Table> for ScratchpadConfig {
             sticky,
             auto_hide_on_focus_loss,
             refocus,
+            move_to_workspace,
+            tile_in_target_workspace,
         })
     }
 }
@@ -773,6 +791,7 @@ sticky = true
         assert_eq!(config.default_size, "75% 60%");
         assert_eq!(config.default_margin, 50);
         assert!(config.move_to_workspace.is_none());
+        assert!(!config.tile_in_target_workspace);
     }
 
     #[test]
@@ -781,11 +800,20 @@ sticky = true
 default_size = "40% 80%"
 default_margin = 100
 move_to_workspace = "tmp"
+tile_in_target_workspace = true
 "#;
         let config: ScratchpadDefaults = toml::from_str(toml).unwrap();
         assert_eq!(config.default_size, "40% 80%");
         assert_eq!(config.default_margin, 100);
         assert_eq!(config.move_to_workspace.as_deref(), Some("tmp"));
+    }
+
+    #[test]
+    fn test_user_config() {
+        let path = "/home/coqanklazy/.config/niri/piri.toml";
+        let config = Config::load(path).unwrap();
+        println!("USER CONFIG scratchpad: {:?}", config.piri.scratchpad);
+        assert!(config.piri.scratchpad.tile_in_target_workspace);
     }
 
     // ==================== ScratchpadConfig ====================
@@ -809,6 +837,8 @@ margin = 50
         assert!(!config.sticky);
         assert!(!config.auto_hide_on_focus_loss);
         assert!(!config.refocus);
+        assert!(config.move_to_workspace.is_none());
+        assert!(config.tile_in_target_workspace.is_none());
     }
 
     #[test]
@@ -823,12 +853,16 @@ swallow_to_focus = true
 sticky = true
 auto_hide_on_focus_loss = false
 refocus = true
+move_to_workspace = "scratch"
+tile_in_target_workspace = true
 "#;
         let config: ScratchpadConfig = toml::from_str(toml).unwrap();
         assert!(config.swallow_to_focus);
         assert!(config.sticky);
         assert!(!config.auto_hide_on_focus_loss);
         assert!(config.refocus);
+        assert_eq!(config.move_to_workspace.as_deref(), Some("scratch"));
+        assert_eq!(config.tile_in_target_workspace, Some(true));
     }
 
     #[test]
@@ -843,6 +877,8 @@ refocus = true
             sticky: false,
             auto_hide_on_focus_loss: false,
             refocus: false,
+            move_to_workspace: None,
+            tile_in_target_workspace: None,
         };
         let (w, h) = config.parse_size().unwrap();
         assert!((w - 0.4).abs() < f64::EPSILON);
@@ -861,6 +897,8 @@ refocus = true
             sticky: false,
             auto_hide_on_focus_loss: false,
             refocus: false,
+            move_to_workspace: None,
+            tile_in_target_workspace: None,
         };
         assert!(config.parse_size().is_err());
     }
@@ -1200,8 +1238,8 @@ animation_repeat = 0
     #[test]
     fn test_piri_config_default() {
         let config: PiriConfig = toml::from_str("").unwrap();
-        assert_eq!(config.swallow.use_pid_matching, true);
-        assert!(config.mark.refocus == false);
+        assert!(config.swallow.use_pid_matching);
+        assert!(!config.mark.refocus);
     }
 
     // ==================== Config (root) ====================

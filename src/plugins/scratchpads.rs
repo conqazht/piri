@@ -11,8 +11,8 @@ use crate::config::{Config, Direction, ScratchpadConfig};
 use crate::ipc::IpcRequest;
 use crate::niri::NiriIpc;
 use crate::plugins::window_utils::{
-    self, get_focused_window, perform_swallow, register_sticky_window, WindowMatcher,
-    WindowMatcherCache,
+    self, get_focused_window, matches_workspace, perform_swallow, register_sticky_window,
+    WindowMatcher, WindowMatcherCache,
 };
 use crate::plugins::FromConfig;
 use crate::plugins::PiriEvent;
@@ -24,6 +24,7 @@ pub struct ScratchpadsPluginConfig {
     pub default_size: String,
     pub default_margin: u32,
     pub move_to_workspace: Option<String>,
+    pub tile_in_target_workspace: bool,
 }
 
 impl Default for ScratchpadsPluginConfig {
@@ -33,6 +34,7 @@ impl Default for ScratchpadsPluginConfig {
             default_size: "75% 60%".to_string(),
             default_margin: 50,
             move_to_workspace: None,
+            tile_in_target_workspace: false,
         }
     }
 }
@@ -46,6 +48,7 @@ impl FromConfig for ScratchpadsPluginConfig {
             default_size: config.piri.scratchpad.default_size.clone(),
             default_margin: config.piri.scratchpad.default_margin,
             move_to_workspace: config.piri.scratchpad.move_to_workspace.clone(),
+            tile_in_target_workspace: config.piri.scratchpad.tile_in_target_workspace,
         })
     }
 }
@@ -145,7 +148,8 @@ impl ScratchpadManager {
     async fn sync_state(
         &mut self,
         name: &str,
-        global_move_to_workspace: Option<String>,
+        target_workspace: Option<String>,
+        should_tile: bool,
     ) -> Result<()> {
         let (mut config, is_visible, window_id, is_dynamic) = {
             let state = self.states.get_mut(name).context("State not found")?;
@@ -215,17 +219,103 @@ impl ScratchpadManager {
         }
 
         if is_visible {
+            // Check if window is currently tiled (e.g. docked in target workspace)
+            let windows = self.niri.get_windows_raw().await?;
+            let is_floating =
+                windows.iter().find(|w| w.id == window_id).map(|w| w.floating).unwrap_or(false);
+
+            if !is_floating {
+                info!(
+                    "Window {} is tiled; preparing for scratchpad show",
+                    window_id
+                );
+                // 1. Make window floating in its current workspace
+                self.niri.set_window_floating(window_id, true).await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // 2. Resize to target dimensions
+                let (target_x, target_y, target_width, target_height) = if is_dynamic {
+                    let (output_width, output_height) = self.niri.get_output_size().await?;
+                    let (tx, ty) = self
+                        .get_target_position(&config, output_width / 2, output_height / 2, true)
+                        .await?;
+                    (tx, ty, output_width / 2, output_height / 2)
+                } else {
+                    self.get_target_geometry(&config, true).await?
+                };
+                self.niri.resize_floating_window(window_id, target_width, target_height).await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // 3. Move it off-screen to hide position before pulling to active workspace
+                let (output_width, output_height) = self.niri.get_output_size().await?;
+                let (hide_x, hide_y) = window_utils::calculate_hide_position(
+                    config.direction,
+                    output_width,
+                    output_height,
+                    target_width,
+                    target_height,
+                    config.margin,
+                );
+
+                let (cur_x, cur_y) = match self.niri.get_window_position_async(window_id).await? {
+                    Some((cx, cy, _, _)) => (cx, cy),
+                    None => (
+                        ((output_width.saturating_sub(target_width)) / 2) as i32,
+                        ((output_height.saturating_sub(target_height)) / 2) as i32,
+                    ),
+                };
+                let _ = window_utils::move_window_to_position(
+                    &self.niri, window_id, cur_x, cur_y, hide_x, hide_y,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // 4. Move to current workspace
+                self.niri.move_floating_window(window_id).await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // 5. Slide into view with animation
+                let (actual_x, actual_y) =
+                    match self.niri.get_window_position_async(window_id).await? {
+                        Some((cx, cy, _, _)) => (cx, cy),
+                        None => (hide_x, hide_y),
+                    };
+                window_utils::move_window_to_position(
+                    &self.niri, window_id, actual_x, actual_y, target_x, target_y,
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                // 6. Focus window
+                window_utils::focus_window(self.niri.clone(), window_id).await?;
+                return Ok(());
+            }
+
             // Move to current workspace if needed
             self.niri.move_floating_window(window_id).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // Get current position and size
-        let (current_x, current_y, current_width, current_height) = self
-            .niri
-            .get_window_position_async(window_id)
-            .await?
-            .context("Failed to get window position")?;
+        // Get current position and size (with retry to handle brief layout recalculations)
+        let mut window_pos = self.niri.get_window_position_async(window_id).await?;
+        if window_pos.is_none() {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                window_pos = self.niri.get_window_position_async(window_id).await?;
+                if window_pos.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let (current_x, current_y, current_width, current_height) = match window_pos {
+            Some(pos) => pos,
+            None => {
+                let (target_vis_x, target_vis_y, default_w, default_h) =
+                    self.get_target_geometry(&config, true).await?;
+                (target_vis_x, target_vis_y, default_w, default_h)
+            }
+        };
 
         // For dynamic scratchpads, update margin from current position before hiding
         if is_dynamic && !is_visible {
@@ -289,17 +379,32 @@ impl ScratchpadManager {
             }
 
             // After hiding and restoring focus, optionally move to a specific workspace if configured
-            if let Some(workspace) = global_move_to_workspace {
-                debug!(
+            if let Some(ref workspace) = target_workspace {
+                info!(
                     "Moving hidden scratchpad window {} to workspace {}",
                     window_id, workspace
                 );
-                if let Err(e) = self.niri.move_window_to_workspace(window_id, &workspace).await {
+                if let Err(e) = self.niri.move_window_to_workspace(window_id, workspace).await {
                     log::warn!(
                         "Failed to move hidden scratchpad to workspace {}: {}",
                         workspace,
                         e
                     );
+                }
+
+                if should_tile {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    info!(
+                        "Tiling hidden scratchpad window {} in workspace {}",
+                        window_id, workspace
+                    );
+                    if let Err(e) = self.niri.set_window_floating(window_id, false).await {
+                        log::warn!(
+                            "Failed to tile scratchpad window in workspace {}: {}",
+                            workspace,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -336,11 +441,11 @@ impl ScratchpadManager {
         let patterns = vec![config.app_id.clone()];
         let matcher = WindowMatcher::new(Some(&patterns), None);
 
-        let window_id = if let Some(window) =
+        let (window_id, is_newly_launched) = if let Some(window) =
             window_utils::find_window_by_matcher(self.niri.clone(), &matcher, &self.matcher_cache)
                 .await?
         {
-            window.id
+            (window.id, false)
         } else {
             window_utils::launch_application(&config.command).await?;
             let window = window_utils::wait_for_window(
@@ -352,10 +457,12 @@ impl ScratchpadManager {
             )
             .await?
             .context("Failed to launch/find window")?;
-            window.id
+            (window.id, true)
         };
 
-        self.setup_window(window_id, &config).await?;
+        if is_newly_launched {
+            self.setup_window(window_id, &config).await?;
+        }
         let state = self.states.get_mut(name).unwrap();
         state.window_id = Some(window_id);
 
@@ -371,7 +478,8 @@ impl ScratchpadManager {
         &mut self,
         name: &str,
         config: Option<ScratchpadConfig>,
-        move_to_workspace: Option<String>,
+        global_move_to_workspace: Option<String>,
+        global_tile_in_target: bool,
     ) -> Result<()> {
         // 1. Ensure state exists
         if !self.states.contains_key(name) {
@@ -388,45 +496,79 @@ impl ScratchpadManager {
             );
         }
 
-        // 2. Ensure window exists and is set up
+        // 2. Ensure window exists
         let window_id = self.ensure_window_id(name).await?;
 
-        // 3. Ensure window is floating; if not, make it floating.
-        // setup_window should have already made the window floating, but
-        // there can be a race where get_windows_raw still reports it as tiled.
-        let is_floating = self
-            .niri
-            .get_windows_raw()
-            .await?
-            .iter()
-            .find(|w| w.id == window_id)
-            .map(|w| w.floating)
+        // 3. Resolve target workspace and tiling preference
+        let (target_workspace, should_tile) = {
+            let state = self.states.get(name).unwrap();
+            let tw = state
+                .config
+                .move_to_workspace
+                .clone()
+                .or_else(|| global_move_to_workspace.clone());
+            let st = state.config.tile_in_target_workspace.unwrap_or(global_tile_in_target);
+            (tw, st)
+        };
+
+        // 4. Get workspace and window info
+        let (current_workspace, windows) =
+            window_utils::get_workspace_and_windows(&self.niri).await?;
+
+        let is_in_target_ws = target_workspace
+            .as_ref()
+            .map(|tw| matches_workspace(&current_workspace, tw))
             .unwrap_or(false);
 
-        if !is_floating {
-            warn!(
-                "Scratchpad '{}' window {} is not floating after setup_window, retrying set_window_floating",
-                name, window_id
+        let window_in_current_ws = windows.iter().any(|w| {
+            w.id == window_id && window_utils::is_window_in_workspace(w, &current_workspace)
+        });
+        // 5. Singleton behavior:
+        // When in target workspace and should_tile is enabled
+        if is_in_target_ws && should_tile {
+            info!(
+                "Scratchpad '{}' is in target workspace {}, handling as singleton",
+                name, current_workspace.name
             );
-            self.niri.set_window_floating(window_id, true).await?;
+
+            // If window is currently elsewhere, move it here
+            if !window_in_current_ws {
+                if let Some(ref target) = target_workspace {
+                    self.niri.move_window_to_workspace(window_id, target).await?;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            // Ensure window is in tiling mode in target workspace
+            self.niri.set_window_floating(window_id, false).await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let focused = self.niri.get_focused_window_id().await?;
+            let state = self.states.get_mut(name).unwrap();
+            state.is_visible = false;
+
+            if focused == Some(window_id) {
+                if let Some(prev) = state.previous_focused_window.take() {
+                    let _ = window_utils::focus_window(self.niri.clone(), prev).await;
+                    return Ok(());
+                }
+            } else {
+                state.previous_focused_window = focused;
+                window_utils::focus_window(self.niri.clone(), window_id).await?;
+            }
+            return Ok(());
         }
 
+        // 6. Normal Scratchpad mode (floating show / hide)
         // Collect all scratchpad window IDs before getting mutable borrow
         let scratchpad_window_ids: Vec<u64> =
             self.states.values().filter_map(|s| s.window_id).collect();
 
         let state = self.states.get_mut(name).unwrap();
 
-        // 4. Determine next state (for floating windows)
         if state.is_visible {
-            let (current_workspace, windows) =
-                window_utils::get_workspace_and_windows(&self.niri).await?;
-            let in_current_workspace = windows.iter().any(|w| {
-                w.id == window_id && window_utils::is_window_in_workspace(w, &current_workspace)
-            });
-
-            if in_current_workspace {
-                // Floating window: just hide it (no refocus for floating)
+            if window_in_current_ws {
+                // Floating window in current workspace: just hide it
                 state.is_visible = false;
             } else {
                 // Already visible but elsewhere, re-record focus and it will be moved in sync_state
@@ -441,8 +583,8 @@ impl ScratchpadManager {
             state.is_visible = true;
         }
 
-        // 5. Sync
-        self.sync_state(name, move_to_workspace).await
+        // 7. Sync
+        self.sync_state(name, target_workspace, should_tile).await
     }
 
     async fn add_current_window(
@@ -468,7 +610,7 @@ impl ScratchpadManager {
                         "Scratchpad '{}' already exists with window {}, executing toggle",
                         name, wid
                     );
-                    return self.toggle(name, None, None).await;
+                    return self.toggle(name, None, None, false).await;
                 }
             }
         }
@@ -483,6 +625,8 @@ impl ScratchpadManager {
             sticky: false,
             auto_hide_on_focus_loss: false,
             refocus: false,
+            move_to_workspace: None,
+            tile_in_target_workspace: None,
         };
 
         self.setup_window(window.id, &config).await?;
@@ -506,12 +650,25 @@ impl ScratchpadManager {
 
     async fn handle_focus_loss(
         &mut self,
-        window_id: u64,
+        focused_window_id: u64,
         move_to_workspace: Option<String>,
+        tile_in_target_workspace: bool,
     ) -> Result<()> {
-        // Get list of windows to check floating status
-        let windows = self.niri.get_windows_raw().await?;
+        // If focus shifted to another scratchpad, do not auto-hide any scratchpad.
+        // This allows multiple scratchpads to be open at the same time.
+        let scratchpad_window_ids: Vec<u64> =
+            self.states.values().filter_map(|s| s.window_id).collect();
+        if scratchpad_window_ids.contains(&focused_window_id) {
+            return Ok(());
+        }
 
+        // Get current focused workspace and all windows
+        let (current_workspace, windows) =
+            window_utils::get_workspace_and_windows(&self.niri).await?;
+
+        // Only auto-hide scratchpads that are currently in the CURRENT workspace.
+        // If the user navigated to another workspace, scratchpads on the previous workspace
+        // stay in place undisturbed.
         let names_to_hide: Vec<String> = self
             .states
             .iter()
@@ -519,12 +676,15 @@ impl ScratchpadManager {
                 state.config.auto_hide_on_focus_loss
                     && state.is_visible
                     && state.window_id.is_some()
-                    && state.window_id != Some(window_id)
+                    && state.window_id != Some(focused_window_id)
             })
             .filter(|(_, state)| {
-                // Only auto-hide if the window is still floating
                 if let Some(wid) = state.window_id {
-                    windows.iter().any(|w| w.id == wid && w.floating)
+                    windows.iter().any(|w| {
+                        w.id == wid
+                            && w.floating
+                            && window_utils::is_window_in_workspace(w, &current_workspace)
+                    })
                 } else {
                     false
                 }
@@ -533,8 +693,20 @@ impl ScratchpadManager {
             .collect();
 
         for name in names_to_hide {
-            debug!("Auto-hiding scratchpad '{}' via toggle", name);
-            if let Err(e) = self.toggle(&name, None, move_to_workspace.clone()).await {
+            info!(
+                "Auto-hiding scratchpad '{}' due to focus loss on workspace {}",
+                name, current_workspace.name
+            );
+            let (target_ws, should_tile) = {
+                let state = self.states.get_mut(&name).unwrap();
+                state.is_visible = false;
+                let tw =
+                    state.config.move_to_workspace.clone().or_else(|| move_to_workspace.clone());
+                let st = state.config.tile_in_target_workspace.unwrap_or(tile_in_target_workspace);
+                (tw, st)
+            };
+
+            if let Err(e) = self.sync_state(&name, target_ws, should_tile).await {
                 warn!("Failed to auto-hide scratchpad '{}': {}", name, e);
             }
         }
@@ -614,7 +786,15 @@ impl crate::plugins::Plugin for ScratchpadsPlugin {
                 info!("Handling scratchpad toggle for: {}", name);
 
                 let config = self.config.scratchpads.get(name).cloned();
-                match self.manager.toggle(name, config, self.config.move_to_workspace.clone()).await
+                match self
+                    .manager
+                    .toggle(
+                        name,
+                        config,
+                        self.config.move_to_workspace.clone(),
+                        self.config.tile_in_target_workspace,
+                    )
+                    .await
                 {
                     Ok(_) => Ok(Some(Ok(()))),
                     Err(e) => {
@@ -654,22 +834,27 @@ impl crate::plugins::Plugin for ScratchpadsPlugin {
     }
 
     async fn handle_event(&mut self, event: &PiriEvent, _niri: &NiriIpc) -> Result<()> {
-        // Scratchpads only handle auto_hide_on_focus_loss; sticky is delegated to sticky plugin
         if let PiriEvent::WindowFocusChanged {
             id: Some(window_id),
         } = event
         {
             self.manager
-                .handle_focus_loss(*window_id, self.config.move_to_workspace.clone())
+                .handle_focus_loss(
+                    *window_id,
+                    self.config.move_to_workspace.clone(),
+                    self.config.tile_in_target_workspace,
+                )
                 .await?;
         }
         Ok(())
     }
 
     fn is_interested_in_event(&self, event: &PiriEvent) -> bool {
-        // Only interested in WindowFocusChanged for auto_hide_on_focus_loss
-        // Sticky behavior is handled entirely by the sticky plugin via global registry
+        let has_auto_hide = self.manager.states.values().any(|s| s.config.auto_hide_on_focus_loss);
+        if !has_auto_hide {
+            return false;
+        }
+
         matches!(event, PiriEvent::WindowFocusChanged { id: Some(_) })
-            && self.manager.states.values().any(|s| s.config.auto_hide_on_focus_loss)
     }
 }

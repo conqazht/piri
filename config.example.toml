@@ -24,6 +24,8 @@ default_size = "40% 60%"
 default_margin = 50
 # Optional: move hidden scratchpads to a specific workspace
 # move_to_workspace = "tmp"
+# Optional: tile hidden scratchpads in target workspace (focuses like singleton when in target workspace)
+# tile_in_target_workspace = false
 
 # Plugins configuration
 # Empty plugin: executes commands when switching to empty workspaces
