@@ -485,19 +485,27 @@ pub fn is_window_in_workspace(window: &Window, workspace: &crate::niri::Workspac
     window.workspace_id == Some(workspace.id)
 }
 
-/// Check if a workspace matches a target workspace identifier (name, index, or ID)
+/// Check if a workspace matches a target workspace identifier (name or index, optionally with @output)
 pub fn matches_workspace(workspace: &crate::niri::Workspace, target: &str) -> bool {
-    if let Ok(idx) = target.parse::<u8>() {
+    let (target_ws, target_output) =
+        target.split_once('@').map(|(w, o)| (w, Some(o))).unwrap_or((target, None));
+
+    if let Some(target_out) = target_output {
+        let output_matches = workspace.output.as_deref().is_some_and(|o| {
+            o == target_out || super::extract_display_prefix(o) == Some(target_out)
+        });
+        if !output_matches {
+            return false;
+        }
+    }
+
+    if let Ok(idx) = target_ws.parse::<u8>() {
         if idx == workspace.idx {
             return true;
         }
     }
-    if let Ok(id) = target.parse::<u64>() {
-        if id == workspace.id {
-            return true;
-        }
-    }
-    workspace.name == target
+
+    workspace.name == target_ws
 }
 
 /// Get current workspace and all windows (commonly used together)

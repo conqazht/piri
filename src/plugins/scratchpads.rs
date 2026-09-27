@@ -533,10 +533,8 @@ impl ScratchpadManager {
 
             // If window is currently elsewhere, move it here
             if !window_in_current_ws {
-                if let Some(ref target) = target_workspace {
-                    self.niri.move_window_to_workspace(window_id, target).await?;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                self.niri.move_floating_window(window_id).await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
             // Ensure window is in tiling mode in target workspace

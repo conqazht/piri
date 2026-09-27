@@ -462,14 +462,8 @@ impl NiriIpc {
         // Get the focused workspace name or index
         let focused_workspace = self.get_focused_workspace().await?;
 
-        // Parse workspace reference
-        let workspace_ref = if let Ok(idx) = focused_workspace.name.parse::<u8>() {
-            WorkspaceReferenceArg::Index(idx)
-        } else if let Ok(id) = focused_workspace.name.parse::<u64>() {
-            WorkspaceReferenceArg::Id(id)
-        } else {
-            WorkspaceReferenceArg::Name(focused_workspace.name.clone())
-        };
+        // Move window to the focused workspace using its exact ID
+        let workspace_ref = WorkspaceReferenceArg::Id(focused_workspace.id);
 
         // Move window to the focused workspace using niri_ipc
         self.send_action(Action::MoveWindowToWorkspace {
