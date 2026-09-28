@@ -372,9 +372,19 @@ impl ScratchpadManager {
                 state.previous_focused_window.take()
             };
             if let Some(id) = previous_focused {
-                debug!("Restoring focus to window {}", id);
-                if let Err(e) = window_utils::focus_window(self.niri.clone(), id).await {
-                    log::warn!("Failed to restore focus to window {}: {}", id, e);
+                // Ensure the window to refocus is in the current workspace to avoid jumping across workspaces
+                if let Ok((current_ws, all_windows)) =
+                    window_utils::get_workspace_and_windows(&self.niri).await
+                {
+                    if all_windows
+                        .iter()
+                        .any(|w| w.id == id && window_utils::is_window_in_workspace(w, &current_ws))
+                    {
+                        debug!("Restoring focus to window {}", id);
+                        if let Err(e) = window_utils::focus_window(self.niri.clone(), id).await {
+                            log::warn!("Failed to restore focus to window {}: {}", id, e);
+                        }
+                    }
                 }
             }
 
@@ -531,27 +541,69 @@ impl ScratchpadManager {
                 name, current_workspace.name
             );
 
+            // Get initially focused window BEFORE moving or tiling
+            let initially_focused = self.niri.get_focused_window_id().await?;
+
             // If window is currently elsewhere, move it here
             if !window_in_current_ws {
                 self.niri.move_floating_window(window_id).await?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Ensure window is in tiling mode in target workspace
+                self.niri.set_window_floating(window_id, false).await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let state = self.states.get_mut(name).unwrap();
+                state.is_visible = false;
+                // Only save previous_focused_window if it was on current_workspace
+                let prev_in_current_ws = initially_focused.filter(|&id| {
+                    id != window_id
+                        && windows.iter().any(|w| {
+                            w.id == id
+                                && window_utils::is_window_in_workspace(w, &current_workspace)
+                        })
+                });
+                state.previous_focused_window = prev_in_current_ws;
+
+                // Always focus the scratchpad window on the target workspace
+                window_utils::focus_window(self.niri.clone(), window_id).await?;
+                return Ok(());
             }
 
+            // Window was already in current workspace:
             // Ensure window is in tiling mode in target workspace
             self.niri.set_window_floating(window_id, false).await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let focused = self.niri.get_focused_window_id().await?;
             let state = self.states.get_mut(name).unwrap();
             state.is_visible = false;
 
-            if focused == Some(window_id) {
+            if initially_focused == Some(window_id) {
+                // Scratchpad window is currently focused: toggle away to previous window in this workspace
                 if let Some(prev) = state.previous_focused_window.take() {
-                    let _ = window_utils::focus_window(self.niri.clone(), prev).await;
+                    let prev_in_current_ws = windows.iter().any(|w| {
+                        w.id == prev && window_utils::is_window_in_workspace(w, &current_workspace)
+                    });
+                    if prev_in_current_ws {
+                        let _ = window_utils::focus_window(self.niri.clone(), prev).await;
+                        return Ok(());
+                    }
+                }
+                // Fallback: if previous_focused_window was not in current workspace, try any other window in current workspace
+                if let Some(other) = windows.iter().find(|w| {
+                    w.id != window_id && window_utils::is_window_in_workspace(w, &current_workspace)
+                }) {
+                    let _ = window_utils::focus_window(self.niri.clone(), other.id).await;
                     return Ok(());
                 }
             } else {
-                state.previous_focused_window = focused;
+                // Scratchpad window is not focused: focus it and save previous focused window
+                let prev_in_current_ws = initially_focused.filter(|&id| {
+                    windows.iter().any(|w| {
+                        w.id == id && window_utils::is_window_in_workspace(w, &current_workspace)
+                    })
+                });
+                state.previous_focused_window = prev_in_current_ws;
                 window_utils::focus_window(self.niri.clone(), window_id).await?;
             }
             return Ok(());
