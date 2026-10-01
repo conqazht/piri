@@ -15,6 +15,7 @@ use crate::plugins::edge_pulse_renderer::{EdgePulseRenderState, EdgePulseRendere
 use crate::plugins::resolve_workspace_config;
 use crate::plugins::window_utils::{perform_swallow, WindowMatcher, WindowMatcherCache};
 use crate::plugins::FromConfig;
+use crate::utils::Debounce;
 use niri_ipc::ColumnDisplay;
 
 struct AutofillGuard {
@@ -29,9 +30,8 @@ impl AutofillGuard {
 
 impl Drop for AutofillGuard {
     fn drop(&mut self) {
-        if let Ok(mut executing) = self.flag.try_lock() {
-            *executing = false;
-        }
+        let mut executing = self.flag.lock().unwrap_or_else(|e| e.into_inner());
+        *executing = false;
     }
 }
 
@@ -85,6 +85,7 @@ pub struct WorkspaceRulePlugin {
     auto_tiled_windows: HashSet<u64>,
     previous_window_sizes: HashMap<u64, (i32, i32)>,
     autofill_executing: Arc<StdMutex<bool>>,
+    resize_debouncer: Debounce,
     edge_pulse_last_render: Option<EdgePulseRenderState>,
     edge_pulse_renderer: EdgePulseRenderer,
     /// Regex cache for matching windows against floating rules
@@ -608,8 +609,9 @@ impl WorkspaceRulePlugin {
         Ok(())
     }
 
-    async fn check_and_align_last_column(
-        &self,
+    async fn check_and_align_last_column_internal(
+        niri: &NiriIpc,
+        autofill_executing: Arc<StdMutex<bool>>,
         target_focus: Option<u64>,
         align_right: bool,
     ) -> Result<()> {
@@ -620,19 +622,146 @@ impl WorkspaceRulePlugin {
 
         crate::plugins::window_utils::mark_programmatic_focus_start();
 
-        let _guard = AutofillGuard::new(Arc::clone(&self.autofill_executing));
+        let _guard = AutofillGuard::new(autofill_executing);
 
-        self.niri
-            .execute_batch(move |socket| {
-                if align_right {
-                    let _ = socket.send(Request::Action(Action::FocusColumnLeft {}))?;
-                    let _ = socket.send(Request::Action(Action::FocusColumnRight {}))?;
-                } else if let Some(target_id) = target_focus {
+        niri.execute_batch(move |socket| {
+            if align_right {
+                let _ = socket.send(Request::Action(Action::FocusColumnLeft {}))?;
+                let _ = socket.send(Request::Action(Action::FocusColumnRight {}))?;
+                if let Some(target_id) = target_focus {
                     let _ = socket.send(Request::Action(Action::FocusWindow { id: target_id }))?;
                 }
+            } else if let Some(target_id) = target_focus {
+                let _ = socket.send(Request::Action(Action::FocusWindow { id: target_id }))?;
+            }
 
-                Ok(())
-            })
+            Ok(())
+        })
+        .await
+    }
+
+    async fn check_and_align_last_column(
+        &self,
+        target_focus: Option<u64>,
+        align_right: bool,
+    ) -> Result<()> {
+        Self::check_and_align_last_column_internal(
+            &self.niri,
+            Arc::clone(&self.autofill_executing),
+            target_focus,
+            align_right,
+        )
+        .await
+    }
+
+    async fn handle_resize_autofill(
+        niri: &NiriIpc,
+        config: &WorkspaceRulePluginConfig,
+        autofill_executing: Arc<StdMutex<bool>>,
+        expected_ws_id: u64,
+    ) -> Result<()> {
+        let current_ws = niri.get_focused_workspace().await?;
+        if current_ws.id != expected_ws_id {
+            debug!("Resize autofill skipped: workspace changed");
+            return Ok(());
+        }
+
+        let ws_idx = current_ws.idx;
+        let ws_name = &current_ws.name;
+        let ws_output = current_ws.output.as_deref();
+
+        let auto_fill = resolve_workspace_config(
+            &config.workspaces,
+            ws_idx,
+            Some(ws_name.as_str()),
+            ws_output,
+        )
+        .map(|c| c.auto_fill)
+        .unwrap_or(config.default.auto_fill);
+
+        if !auto_fill {
+            return Ok(());
+        }
+
+        let Some(focused_id) = niri.get_focused_window_id().await? else {
+            return Ok(());
+        };
+
+        let windows = niri.get_windows_raw().await?;
+        if windows.iter().any(|w| w.id == focused_id && w.floating) {
+            debug!(
+                "Resize autofill skipped: focused window {} is floating",
+                focused_id
+            );
+            return Ok(());
+        }
+
+        let ws_windows: Vec<_> = windows
+            .iter()
+            .filter(|w| !w.floating && w.workspace_id == Some(current_ws.id))
+            .collect();
+
+        if ws_windows.len() <= 1 {
+            return Ok(());
+        }
+
+        let mut max_col = 0;
+        let mut focused_col = None;
+        for w in &ws_windows {
+            if let Some((col, _)) = w.layout.as_ref().and_then(|l| l.pos_in_scrolling_layout) {
+                if col > max_col {
+                    max_col = col;
+                }
+                if w.id == focused_id {
+                    focused_col = Some(col);
+                }
+            }
+        }
+
+        if max_col <= 1 || focused_col != Some(max_col) {
+            return Ok(());
+        }
+
+        if let Ok(output) = niri.get_focused_output().await {
+            if let Some(logical) = output.logical {
+                let mut col_widths: HashMap<usize, f64> = HashMap::new();
+                for w in &ws_windows {
+                    if let Some(layout) = &w.layout {
+                        if let Some((col, _)) = layout.pos_in_scrolling_layout {
+                            let width = layout.effective_width();
+                            col_widths
+                                .entry(col)
+                                .and_modify(|e| *e = (*e).max(width))
+                                .or_insert(width);
+                        }
+                    }
+                }
+                let total_width: f64 = col_widths.values().sum();
+                if total_width <= logical.width as f64 {
+                    debug!(
+                        "Resize autofill skipped: total columns width ({:.1}) <= output width ({})",
+                        total_width, logical.width
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        {
+            let mut executing = autofill_executing.lock().unwrap_or_else(|e| e.into_inner());
+            if *executing {
+                debug!("Resize autofill ignored: already executing");
+                return Ok(());
+            }
+            *executing = true;
+        }
+
+        info!(
+            "Auto_fill: aligning last column after resize in workspace {} (focused window {}, col {}/{})",
+            ws_idx, focused_id, max_col, max_col
+        );
+
+        Self::check_and_align_last_column_internal(niri, autofill_executing, Some(focused_id), true)
             .await
     }
 
@@ -900,6 +1029,7 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
             auto_tiled_windows: HashSet::new(),
             previous_window_sizes: HashMap::new(),
             autofill_executing: Arc::new(StdMutex::new(false)),
+            resize_debouncer: Debounce::new(),
             edge_pulse_last_render: None,
             edge_pulse_renderer: EdgePulseRenderer::new(),
             matcher_cache: Arc::new(WindowMatcherCache::new()),
@@ -914,7 +1044,14 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
     ) -> Result<()> {
         if self.window_columns.is_empty() {
             if let Ok(windows) = self.niri.get_windows_raw().await {
-                for w in windows {
+                for w in &windows {
+                    self.window_floating_state.insert(w.id, w.floating);
+                    if let Some(layout) = &w.layout {
+                        if let Some(size) = layout.window_size {
+                            self.previous_window_sizes
+                                .insert(w.id, (size[0] as i32, size[1] as i32));
+                        }
+                    }
                     if !w.floating {
                         if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
                             if let Some(pos) = layout.pos_in_scrolling_layout {
@@ -958,11 +1095,10 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
                 let has_size_change = changes.iter().any(|(win_id, layout)| {
                     let is_floating =
                         self.window_floating_state.get(win_id).copied().unwrap_or(false);
-                    let changed = self
-                        .previous_window_sizes
-                        .get(win_id)
-                        .map(|prev| prev != &layout.window_size)
-                        .unwrap_or(false);
+                    let changed = match self.previous_window_sizes.get(win_id) {
+                        Some(prev) => prev != &layout.window_size,
+                        None => true,
+                    };
                     if !is_floating && changed {
                         self.previous_window_sizes.insert(*win_id, layout.window_size);
                     }
@@ -971,6 +1107,33 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
 
                 if has_size_change {
                     self.sync_edge_pulse_indicator(None).await?;
+
+                    if self.get_auto_fill(
+                        current_ws.idx,
+                        Some(current_ws.name.as_str()),
+                        current_ws.output.as_deref(),
+                    ) {
+                        let niri = self.niri.clone();
+                        let config = self.config.clone();
+                        let autofill_executing = Arc::clone(&self.autofill_executing);
+                        let ws_id = current_ws.id;
+
+                        self.resize_debouncer.debounce(
+                            Duration::from_millis(200),
+                            move || async move {
+                                if let Err(e) = Self::handle_resize_autofill(
+                                    &niri,
+                                    &config,
+                                    autofill_executing,
+                                    ws_id,
+                                )
+                                .await
+                                {
+                                    warn!("Resize autofill failed: {}", e);
+                                }
+                            },
+                        );
+                    }
                 }
             }
             crate::plugins::PiriEvent::WorkspaceActivated { id, focused: true } => {
@@ -979,6 +1142,8 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
             }
             crate::plugins::PiriEvent::WindowsChanged { windows } => {
                 for w in windows {
+                    self.window_floating_state.insert(w.id, w.is_floating);
+                    self.previous_window_sizes.insert(w.id, w.layout.window_size);
                     if !w.is_floating {
                         if let (Some(ws_id), Some(pos)) =
                             (w.workspace_id, w.layout.pos_in_scrolling_layout)
@@ -1013,6 +1178,7 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
         self.matcher_cache.clear_cache();
         self.edge_pulse_last_render = None;
         self.edge_pulse_renderer.shutdown();
+        self.resize_debouncer.cancel();
         Ok(())
     }
 }
