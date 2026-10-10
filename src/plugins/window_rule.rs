@@ -97,6 +97,8 @@ pub struct WindowRulePlugin {
     /// Settle flags for the delayed fallback: set when the event path
     /// finishes a panel, so the fallback task skips already-settled windows
     settle_done: HashMap<u64, Arc<AtomicBool>>,
+    /// Window workspace tracking: window_id -> workspace_id
+    window_workspaces: HashMap<u64, u64>,
 }
 
 impl WindowRulePlugin {
@@ -213,11 +215,15 @@ impl WindowRulePlugin {
         rules: &[WindowRuleConfig],
         cache: &WindowMatcherCache,
         workspace_id: u64,
+        exclude_window_id: Option<u64>,
     ) -> Result<()> {
         const GAP: f64 = 16.0;
         let windows = niri.get_windows().await?;
-        let mut panels: Vec<(u64, f64, f64, f64)> = Vec::new(); // id, x, y, w
+        let mut panels: Vec<(u64, f64, f64, f64, usize)> = Vec::new(); // id, x, y, w, rule_idx
         for w in &windows {
+            if Some(w.id) == exclude_window_id {
+                continue;
+            }
             if !w.floating || w.workspace_id != Some(workspace_id) {
                 continue;
             }
@@ -229,19 +235,39 @@ impl WindowRulePlugin {
                     let rule_w = rules[rule_idx].floating_width.map(|w| w as f64).unwrap_or(0.0);
                     let w_eff = layout.effective_width().max(rule_w);
                     if w_eff > 0.0 {
-                        panels.push((w.id, pos[0], pos[1], w_eff));
+                        panels.push((w.id, pos[0], pos[1], w_eff, rule_idx));
                     }
                 }
             }
         }
-        if panels.len() < 2 {
+        if panels.is_empty() {
+            return Ok(());
+        }
+        if panels.len() == 1 {
+            let (id, cur_x, _, w, rule_idx) = panels[0];
+            let (out_w, _) = niri.get_output_size().await?;
+            let target_x = ((out_w as f64 - w) / 2.0).max(0.0);
+            let dx = (target_x - cur_x).round() as i32;
+            if dx != 0 {
+                if rules[rule_idx].floating_centered {
+                    if let Err(e) = niri.center_window(id).await {
+                        debug!(
+                            "Failed to center window {}: {:#}, falling back to relative move",
+                            id, e
+                        );
+                        niri.move_window_relative(id, dx, 0).await?;
+                    }
+                } else {
+                    niri.move_window_relative(id, dx, 0).await?;
+                }
+            }
             return Ok(());
         }
         panels.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let total: f64 = panels.iter().map(|p| p.3).sum::<f64>() + GAP * (panels.len() - 1) as f64;
         let (out_w, _) = niri.get_output_size().await?;
         let mut x = ((out_w as f64 - total) / 2.0).max(0.0);
-        for (id, cur_x, _, w) in panels {
+        for (id, cur_x, _, w, _) in panels {
             let dx = (x - cur_x).round() as i32;
             if dx != 0 {
                 niri.move_window_relative(id, dx, 0).await?;
@@ -385,7 +411,14 @@ impl WindowRulePlugin {
             Some(id) => id,
             None => self.niri.get_focused_workspace().await.map(|ws| ws.id)?,
         };
-        Self::arrange_row(&self.niri, &self.config.rules, &self.matcher_cache, ws_id).await
+        Self::arrange_row(
+            &self.niri,
+            &self.config.rules,
+            &self.matcher_cache,
+            ws_id,
+            None,
+        )
+        .await
     }
 
     async fn continue_floating_action(
@@ -440,7 +473,7 @@ impl WindowRulePlugin {
                         if let Some(ws_id) =
                             windows.iter().find(|w| w.id == window_id).and_then(|w| w.workspace_id)
                         {
-                            let _ = Self::arrange_row(&niri, &rules, &cache, ws_id).await;
+                            let _ = Self::arrange_row(&niri, &rules, &cache, ws_id, None).await;
                         }
                     }
                 });
@@ -673,10 +706,21 @@ impl crate::plugins::Plugin for WindowRulePlugin {
             pending_floating_rules: HashMap::new(),
             pending_center_rules: HashMap::new(),
             settle_done: HashMap::new(),
+            window_workspaces: HashMap::new(),
         }
     }
 
     async fn handle_event(&mut self, event: &PiriEvent, _niri: &NiriIpc) -> Result<()> {
+        if self.window_workspaces.is_empty() {
+            if let Ok(windows) = self.niri.get_windows().await {
+                for w in &windows {
+                    if let Some(ws_id) = w.workspace_id {
+                        self.window_workspaces.insert(w.id, ws_id);
+                    }
+                }
+            }
+        }
+
         match event {
             PiriEvent::WindowFocusChanged {
                 id: Some(window_id),
@@ -685,9 +729,15 @@ impl crate::plugins::Plugin for WindowRulePlugin {
                 self.handle_focus_command(*window_id).await?;
             }
             PiriEvent::WindowOpened { window } => {
+                if let Some(ws_id) = window.workspace_id {
+                    self.window_workspaces.insert(window.id, ws_id);
+                }
                 self.handle_window_opened(window).await?;
             }
             PiriEvent::WindowChanged { window } => {
+                if let Some(ws_id) = window.workspace_id {
+                    self.window_workspaces.insert(window.id, ws_id);
+                }
                 self.enforce_workspace_lock(window).await.ok();
                 if let Some((_, action)) = self.pending_center_rules.get(&window.id) {
                     if action.size_is_committed(&window.layout) {
@@ -698,12 +748,37 @@ impl crate::plugins::Plugin for WindowRulePlugin {
                 }
             }
             PiriEvent::WindowToggleFloating { window } => {
+                if let Some(ws_id) = window.workspace_id {
+                    self.window_workspaces.insert(window.id, ws_id);
+                }
                 if window.is_floating {
                     self.finish_pending_floating_action(window.id).await?;
+                } else {
+                    let was_floating_panel =
+                        self.applied_floating_rules.iter().any(|(_, win_id)| *win_id == window.id);
+                    if was_floating_panel {
+                        self.applied_floating_rules.retain(|(_, win_id)| *win_id != window.id);
+                        if let Some(ws_id) = window.workspace_id {
+                            if let Err(e) = Self::arrange_row(
+                                &self.niri,
+                                &self.config.rules,
+                                &self.matcher_cache,
+                                ws_id,
+                                Some(window.id),
+                            )
+                            .await
+                            {
+                                debug!("Row arrangement on window unfloated failed: {:#}", e);
+                            }
+                        }
+                    }
                 }
             }
             PiriEvent::WindowsChanged { windows } => {
                 for window in windows {
+                    if let Some(ws_id) = window.workspace_id {
+                        self.window_workspaces.insert(window.id, ws_id);
+                    }
                     self.handle_dynamic_window_rule(window).await?;
                 }
             }
@@ -717,11 +792,34 @@ impl crate::plugins::Plugin for WindowRulePlugin {
                 }
             }
             PiriEvent::WindowClosed { id } => {
+                let ws_id = self.window_workspaces.remove(id);
+                let was_floating_panel =
+                    self.applied_floating_rules.iter().any(|(_, win_id)| *win_id == *id);
                 self.locked_windows.remove(id);
                 self.applied_floating_rules.retain(|(_, window_id)| window_id != id);
                 self.pending_floating_rules.remove(id);
                 self.pending_center_rules.remove(id);
                 self.settle_done.remove(id);
+
+                if was_floating_panel {
+                    let target_ws = match ws_id {
+                        Some(ws) => Some(ws),
+                        None => self.niri.get_focused_workspace().await.ok().map(|ws| ws.id),
+                    };
+                    if let Some(ws) = target_ws {
+                        if let Err(e) = Self::arrange_row(
+                            &self.niri,
+                            &self.config.rules,
+                            &self.matcher_cache,
+                            ws,
+                            Some(*id),
+                        )
+                        .await
+                        {
+                            debug!("Row arrangement on window closed failed: {:#}", e);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -754,6 +852,7 @@ impl crate::plugins::Plugin for WindowRulePlugin {
         self.pending_floating_rules.clear();
         self.pending_center_rules.clear();
         self.settle_done.clear();
+        self.window_workspaces.clear();
         Ok(())
     }
 }
