@@ -4,7 +4,7 @@ use log::{debug, info};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +99,8 @@ pub struct WindowRulePlugin {
     settle_done: HashMap<u64, Arc<AtomicBool>>,
     /// Window workspace tracking: window_id -> workspace_id
     window_workspaces: HashMap<u64, u64>,
+    /// Window creation timestamp for newly opened windows: window_id -> Instant
+    window_open_times: HashMap<u64, Instant>,
 }
 
 impl WindowRulePlugin {
@@ -573,6 +575,20 @@ impl WindowRulePlugin {
         let Some(floating) = rule.floating else {
             return Ok(());
         };
+
+        // If on_open_only is set and the window is currently tiled, only apply if the
+        // window was newly opened (within 2s). This prevents tab title changes in existing
+        // browser windows from accidentally turning the whole browser into a floating window.
+        if rule.on_open_only && !window.is_floating && floating {
+            let is_newly_opened = self
+                .window_open_times
+                .get(&window.id)
+                .is_some_and(|opened_at| opened_at.elapsed() < Duration::from_millis(2000));
+            if !is_newly_opened {
+                return Ok(());
+            }
+        }
+
         let action = FloatingAction {
             floating,
             width: rule.floating_width,
@@ -707,6 +723,7 @@ impl crate::plugins::Plugin for WindowRulePlugin {
             pending_center_rules: HashMap::new(),
             settle_done: HashMap::new(),
             window_workspaces: HashMap::new(),
+            window_open_times: HashMap::new(),
         }
     }
 
@@ -729,6 +746,7 @@ impl crate::plugins::Plugin for WindowRulePlugin {
                 self.handle_focus_command(*window_id).await?;
             }
             PiriEvent::WindowOpened { window } => {
+                self.window_open_times.insert(window.id, Instant::now());
                 if let Some(ws_id) = window.workspace_id {
                     self.window_workspaces.insert(window.id, ws_id);
                 }
@@ -792,6 +810,7 @@ impl crate::plugins::Plugin for WindowRulePlugin {
                 }
             }
             PiriEvent::WindowClosed { id } => {
+                self.window_open_times.remove(id);
                 let ws_id = self.window_workspaces.remove(id);
                 let was_floating_panel =
                     self.applied_floating_rules.iter().any(|(_, win_id)| *win_id == *id);
@@ -853,6 +872,7 @@ impl crate::plugins::Plugin for WindowRulePlugin {
         self.pending_center_rules.clear();
         self.settle_done.clear();
         self.window_workspaces.clear();
+        self.window_open_times.clear();
         Ok(())
     }
 }

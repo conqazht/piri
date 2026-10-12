@@ -248,6 +248,10 @@ pub struct WindowRuleConfig {
     /// Center the window after moving it to the floating layer
     #[serde(default)]
     pub floating_centered: bool,
+    /// Only apply rule when window is first opened (or within 2s of creation),
+    /// never on subsequent dynamic title changes of established windows.
+    #[serde(default)]
+    pub on_open_only: bool,
     /// Command to execute when a matching window is focused (optional)
     pub focus_command: Option<String>,
     /// If true, focus_command will only execute on the first focus (default: false)
@@ -994,6 +998,18 @@ focus_command_once = true
 "#;
         let config: WindowRuleConfig = toml::from_str(toml).unwrap();
         assert!(config.focus_command_once);
+    }
+
+    #[test]
+    fn test_window_rule_config_on_open_only() {
+        let toml = r#"
+title = ".*Google.*"
+floating = true
+on_open_only = true
+"#;
+        let config: WindowRuleConfig = toml::from_str(toml).unwrap();
+        assert!(config.on_open_only);
+        assert_eq!(config.floating, Some(true));
     }
 
     // ==================== WindowOrderSection ====================
