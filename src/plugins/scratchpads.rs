@@ -700,7 +700,7 @@ impl ScratchpadManager {
 
     async fn handle_focus_loss(
         &mut self,
-        focused_window_id: u64,
+        focused_window_id: Option<u64>,
         move_to_workspace: Option<String>,
         tile_in_target_workspace: bool,
     ) -> Result<()> {
@@ -708,17 +708,16 @@ impl ScratchpadManager {
         // This allows multiple scratchpads to be open at the same time.
         let scratchpad_window_ids: Vec<u64> =
             self.states.values().filter_map(|s| s.window_id).collect();
-        if scratchpad_window_ids.contains(&focused_window_id) {
-            return Ok(());
+        if let Some(focused_id) = focused_window_id {
+            if scratchpad_window_ids.contains(&focused_id) {
+                return Ok(());
+            }
         }
 
-        // Get current focused workspace and all windows
-        let (current_workspace, windows) =
-            window_utils::get_workspace_and_windows(&self.niri).await?;
+        let windows = self.niri.get_windows().await?;
 
-        // Only auto-hide scratchpads that are currently in the CURRENT workspace.
-        // If the user navigated to another workspace, scratchpads on the previous workspace
-        // stay in place undisturbed.
+        // Auto-hide any visible floating scratchpad when focus is lost (whether to another window
+        // on the same workspace, another workspace, or when no window is focused).
         let names_to_hide: Vec<String> = self
             .states
             .iter()
@@ -726,15 +725,11 @@ impl ScratchpadManager {
                 state.config.auto_hide_on_focus_loss
                     && state.is_visible
                     && state.window_id.is_some()
-                    && state.window_id != Some(focused_window_id)
+                    && state.window_id != focused_window_id
             })
             .filter(|(_, state)| {
                 if let Some(wid) = state.window_id {
-                    windows.iter().any(|w| {
-                        w.id == wid
-                            && w.floating
-                            && window_utils::is_window_in_workspace(w, &current_workspace)
-                    })
+                    windows.iter().any(|w| w.id == wid && w.floating)
                 } else {
                     false
                 }
@@ -743,13 +738,11 @@ impl ScratchpadManager {
             .collect();
 
         for name in names_to_hide {
-            info!(
-                "Auto-hiding scratchpad '{}' due to focus loss on workspace {}",
-                name, current_workspace.name
-            );
+            info!("Auto-hiding scratchpad '{}' due to focus loss", name);
             let (target_ws, should_tile) = {
                 let state = self.states.get_mut(&name).unwrap();
                 state.is_visible = false;
+                state.previous_focused_window = None;
                 let tw =
                     state.config.move_to_workspace.clone().or_else(|| move_to_workspace.clone());
                 let st = state.config.tile_in_target_workspace.unwrap_or(tile_in_target_workspace);
@@ -883,18 +876,28 @@ impl crate::plugins::Plugin for ScratchpadsPlugin {
         }
     }
 
-    async fn handle_event(&mut self, event: &PiriEvent, _niri: &NiriIpc) -> Result<()> {
-        if let PiriEvent::WindowFocusChanged {
-            id: Some(window_id),
-        } = event
-        {
-            self.manager
-                .handle_focus_loss(
-                    *window_id,
-                    self.config.move_to_workspace.clone(),
-                    self.config.tile_in_target_workspace,
-                )
-                .await?;
+    async fn handle_event(&mut self, event: &PiriEvent, niri: &NiriIpc) -> Result<()> {
+        match event {
+            PiriEvent::WindowFocusChanged { id } => {
+                self.manager
+                    .handle_focus_loss(
+                        *id,
+                        self.config.move_to_workspace.clone(),
+                        self.config.tile_in_target_workspace,
+                    )
+                    .await?;
+            }
+            PiriEvent::WorkspaceActivated { focused: true, .. } => {
+                let focused_id = niri.get_focused_window_id().await.ok().flatten();
+                self.manager
+                    .handle_focus_loss(
+                        focused_id,
+                        self.config.move_to_workspace.clone(),
+                        self.config.tile_in_target_workspace,
+                    )
+                    .await?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -905,6 +908,10 @@ impl crate::plugins::Plugin for ScratchpadsPlugin {
             return false;
         }
 
-        matches!(event, PiriEvent::WindowFocusChanged { id: Some(_) })
+        matches!(
+            event,
+            PiriEvent::WindowFocusChanged { .. }
+                | PiriEvent::WorkspaceActivated { focused: true, .. }
+        )
     }
 }
