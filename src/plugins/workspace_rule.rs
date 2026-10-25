@@ -92,6 +92,8 @@ pub struct WorkspaceRulePlugin {
     matcher_cache: Arc<WindowMatcherCache>,
     /// Tracks column positions of tiled windows: window_id -> (workspace_id, col_idx)
     window_columns: HashMap<u64, (u64, usize)>,
+    /// Windows deferred during on_window_opened because they were untitled potential panels
+    pending_untitled_windows: HashSet<u64>,
 }
 
 impl WorkspaceRulePlugin {
@@ -765,99 +767,114 @@ impl WorkspaceRulePlugin {
             .await
     }
 
+    async fn process_new_tiled_window(
+        &mut self,
+        window_id: u64,
+        workspace_id: Option<u64>,
+    ) -> Result<()> {
+        debug!("Processing new tiled window: {}", window_id);
+        let windows = self.niri.get_windows_raw().await?;
+        for w in &windows {
+            if !w.floating {
+                if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
+                    if let Some(pos) = layout.pos_in_scrolling_layout {
+                        self.window_columns.insert(w.id, (ws_id, pos.0));
+                    }
+                }
+            }
+        }
+
+        if let Some(full_window) = windows.iter().find(|w| w.id == window_id) {
+            let auto_tiled = self.handle_auto_tile(full_window).await.unwrap_or(false);
+            if auto_tiled {
+                self.auto_tiled_windows.insert(window_id);
+            }
+        }
+
+        self.apply_widths().await?;
+
+        if let Some(ws_id) = workspace_id {
+            let current_ws = self.niri.get_focused_workspace().await?;
+            if current_ws.id == ws_id {
+                let ws_idx = current_ws.idx;
+                let ws_name = &current_ws.name;
+                let ws_output = current_ws.output.as_deref();
+
+                if self.get_auto_fill(ws_idx, Some(ws_name.as_str()), ws_output) {
+                    let ws_windows: Vec<_> = windows
+                        .iter()
+                        .filter(|w| !w.floating && w.workspace_id == Some(ws_id))
+                        .collect();
+
+                    let max_col = ws_windows
+                        .iter()
+                        .filter_map(|w| {
+                            w.layout.as_ref().and_then(|l| l.pos_in_scrolling_layout).map(|p| p.0)
+                        })
+                        .max()
+                        .unwrap_or(0);
+
+                    let my_col = self.window_columns.get(&window_id).map(|(_, c)| *c).unwrap_or(0);
+
+                    if my_col == max_col && max_col > 1 {
+                        info!(
+                            "Auto_fill: new window {} is the last column ({}/{}), aligning right",
+                            window_id, my_col, max_col
+                        );
+                        self.try_execute_autofill(
+                            ws_idx,
+                            Some(ws_name.as_str()),
+                            ws_output,
+                            "new window in last column",
+                            None,
+                            true,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn on_window_opened(&mut self, window: &niri_ipc::Window) -> Result<()> {
         self.previous_window_sizes.insert(window.id, window.layout.window_size);
         self.window_floating_state.insert(window.id, window.is_floating);
 
-        let is_potential_floating_panel = !window.is_floating
-            && (self.matches_floating_rule(window)?
-                || (window.title.as_deref().is_none_or(str::is_empty)
-                    && self
-                        .config
-                        .floating_rules
-                        .iter()
-                        .any(|r| r.title.is_some() && r.app_id.is_none())));
+        if window.is_floating {
+            debug!("New floating window: {}", window.id);
+            self.sync_edge_pulse_indicator(None).await?;
+            return Ok(());
+        }
 
-        if is_potential_floating_panel {
+        if self.matches_floating_rule(window)? {
             debug!(
-                "Window {} matches a floating rule (or is untitled potential panel), skipping tiling adjustments",
+                "Window {} matches a floating rule, skipping tiling adjustments",
                 window.id
             );
             self.sync_edge_pulse_indicator(None).await?;
             return Ok(());
         }
 
-        if window.is_floating {
-            debug!("New floating window: {}", window.id);
-        } else {
-            debug!("New tiled window: {}", window.id);
-            let windows = self.niri.get_windows_raw().await?;
-            for w in &windows {
-                if !w.floating {
-                    if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
-                        if let Some(pos) = layout.pos_in_scrolling_layout {
-                            self.window_columns.insert(w.id, (ws_id, pos.0));
-                        }
-                    }
-                }
-            }
+        let is_untitled_potential_panel = window.title.as_deref().is_none_or(str::is_empty)
+            && self
+                .config
+                .floating_rules
+                .iter()
+                .any(|r| r.title.is_some() && r.app_id.is_none());
 
-            if let Some(full_window) = windows.iter().find(|w| w.id == window.id) {
-                let auto_tiled = self.handle_auto_tile(full_window).await.unwrap_or(false);
-                if auto_tiled {
-                    self.auto_tiled_windows.insert(window.id);
-                }
-            }
-
-            self.apply_widths().await?;
-
-            if let Some(ws_id) = window.workspace_id {
-                let current_ws = self.niri.get_focused_workspace().await?;
-                if current_ws.id == ws_id {
-                    let ws_idx = current_ws.idx;
-                    let ws_name = &current_ws.name;
-                    let ws_output = current_ws.output.as_deref();
-
-                    if self.get_auto_fill(ws_idx, Some(ws_name.as_str()), ws_output) {
-                        let ws_windows: Vec<_> = windows
-                            .iter()
-                            .filter(|w| !w.floating && w.workspace_id == Some(ws_id))
-                            .collect();
-
-                        let max_col = ws_windows
-                            .iter()
-                            .filter_map(|w| {
-                                w.layout
-                                    .as_ref()
-                                    .and_then(|l| l.pos_in_scrolling_layout)
-                                    .map(|p| p.0)
-                            })
-                            .max()
-                            .unwrap_or(0);
-
-                        let my_col =
-                            self.window_columns.get(&window.id).map(|(_, c)| *c).unwrap_or(0);
-
-                        if my_col == max_col && max_col > 1 {
-                            info!(
-                                "Auto_fill: new window {} is the last column ({}/{}), aligning right",
-                                window.id, my_col, max_col
-                            );
-                            self.try_execute_autofill(
-                                ws_idx,
-                                Some(ws_name.as_str()),
-                                ws_output,
-                                "new window in last column",
-                                None,
-                                true,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
+        if is_untitled_potential_panel {
+            debug!(
+                "Window {} is untitled potential panel, deferring tiling adjustments",
+                window.id
+            );
+            self.pending_untitled_windows.insert(window.id);
+            self.sync_edge_pulse_indicator(None).await?;
+            return Ok(());
         }
 
+        debug!("New tiled window: {}", window.id);
+        self.process_new_tiled_window(window.id, window.workspace_id).await?;
         self.sync_edge_pulse_indicator(None).await?;
         Ok(())
     }
@@ -870,6 +887,22 @@ impl WorkspaceRulePlugin {
                 self.window_columns.insert(window.id, (ws_id, pos.0));
             }
         }
+
+        if self.pending_untitled_windows.remove(&window.id) {
+            if window.is_floating || self.matches_floating_rule(window)? {
+                debug!(
+                    "Deferred window {} confirmed floating/panel, skipping tiling",
+                    window.id
+                );
+            } else {
+                debug!(
+                    "Deferred window {} now resolved with title {:?}, processing as tiled window",
+                    window.id, window.title
+                );
+                self.process_new_tiled_window(window.id, window.workspace_id).await?;
+            }
+        }
+
         self.sync_edge_pulse_indicator(None).await?;
         Ok(())
     }
@@ -907,6 +940,7 @@ impl WorkspaceRulePlugin {
         self.maximized_windows.remove(&window_id);
         self.auto_tiled_windows.remove(&window_id);
         self.previous_window_sizes.remove(&window_id);
+        self.pending_untitled_windows.remove(&window_id);
 
         let closed_col_info = self.window_columns.remove(&window_id);
 
@@ -1034,6 +1068,7 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
             edge_pulse_renderer: EdgePulseRenderer::new(),
             matcher_cache: Arc::new(WindowMatcherCache::new()),
             window_columns: HashMap::new(),
+            pending_untitled_windows: HashSet::new(),
         }
     }
 
@@ -1089,6 +1124,22 @@ impl crate::plugins::Plugin for WorkspaceRulePlugin {
                         } else {
                             self.window_columns.insert(*win_id, (current_ws.id, pos.0));
                         }
+                    }
+                }
+
+                let pending_to_process: Vec<u64> = changes
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .filter(|id| self.pending_untitled_windows.remove(id))
+                    .collect();
+
+                if !pending_to_process.is_empty() {
+                    for win_id in pending_to_process {
+                        debug!(
+                            "Deferred window {} layout committed, processing as tiled window",
+                            win_id
+                        );
+                        let _ = self.process_new_tiled_window(win_id, Some(current_ws.id)).await;
                     }
                 }
 
