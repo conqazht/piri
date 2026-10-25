@@ -15,6 +15,8 @@ pub mod workspace_rule;
 use anyhow::Result;
 use async_trait::async_trait;
 use log::{debug, info, warn};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
@@ -293,16 +295,74 @@ impl PluginManager {
 
         // Outer loop: reconnect on connection failure
         loop {
-            let socket = match niri.create_event_stream_socket() {
-                Ok(s) => s,
+            let socket_path = match niri.get_socket_path() {
+                Ok(path) => path,
                 Err(e) => {
-                    warn!("Failed to create event stream: {}, retrying in 1s", e);
+                    warn!("Failed to get niri socket path: {}, retrying in 1s", e);
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
             };
 
-            let mut read_event = socket.read_events();
+            let stream = match UnixStream::connect(&socket_path).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("Failed to connect to niri socket: {}, retrying in 1s", e);
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+            };
+
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = BufReader::new(reader);
+
+            // Request event stream
+            let req = match serde_json::to_string(&niri_ipc::Request::EventStream) {
+                Ok(mut s) => {
+                    s.push('\n');
+                    s
+                }
+                Err(e) => {
+                    warn!("Failed to serialize EventStream request: {}", e);
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = writer.write_all(req.as_bytes()).await {
+                warn!("Failed to send EventStream request: {}, retrying in 1s", e);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
+            }
+
+            // Read handshake reply
+            let mut handshake = String::new();
+            if let Err(e) = buf_reader.read_line(&mut handshake).await {
+                warn!(
+                    "Failed to read event stream handshake: {}, retrying in 1s",
+                    e
+                );
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
+            }
+
+            match serde_json::from_str::<niri_ipc::Reply>(&handshake) {
+                Ok(niri_ipc::Reply::Ok(_)) => {}
+                Ok(niri_ipc::Reply::Err(err)) => {
+                    warn!("Failed to request event stream from niri: {}", err);
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to parse event stream handshake: {}, retrying in 1s",
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+            }
+
             info!("Event stream connected, waiting for events...");
 
             // Send notification on first successful connection
@@ -314,13 +374,39 @@ impl PluginManager {
                 is_first_connection = false;
             }
 
-            while let Ok(event) = read_event() {
-                debug!("Raw event received: {:?}", event);
-
-                // Send event to channel for distribution
-                if event_tx.send(event).is_err() {
-                    warn!("Event channel closed, stopping event listener");
-                    return;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match buf_reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        warn!("Event stream closed (EOF)");
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<niri_ipc::Event>(trimmed) {
+                            Ok(event) => {
+                                debug!("Raw event received: {:?}", event);
+                                if event_tx.send(event).is_err() {
+                                    warn!("Event channel closed, stopping event listener");
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Ignoring unknown niri event (possibly from newer niri version): {}: {}",
+                                    trimmed, e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Error reading from event stream: {}", e);
+                        break;
+                    }
                 }
             }
 

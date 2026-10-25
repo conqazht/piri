@@ -129,6 +129,19 @@ impl NiriIpc {
         }
     }
 
+    /// Get socket path
+    pub fn get_socket_path(&self) -> Result<PathBuf> {
+        let path_guard = self.inner.socket_path.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref path) = *path_guard {
+            Ok(path.clone())
+        } else {
+            let socket_path = std::env::var_os("NIRI_SOCKET").ok_or_else(|| {
+                anyhow::anyhow!("NIRI_SOCKET is not set, are you running this within niri?")
+            })?;
+            Ok(PathBuf::from(socket_path))
+        }
+    }
+
     /// Connect to niri socket
     fn connect_internal(&self) -> Result<Socket> {
         let path_guard = self.inner.socket_path.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,21 +678,5 @@ impl NiriIpc {
         window_id: u64,
     ) -> Result<Option<(i32, i32, u32, u32)>> {
         self.get_window_position(window_id).await
-    }
-
-    /// Create an event stream socket for listening to niri events
-    /// This returns a socket that has already requested the event stream
-    pub fn create_event_stream_socket(&self) -> Result<Socket> {
-        let mut socket = self.connect_internal()?;
-
-        // Request event stream
-        match socket.send(Request::EventStream)? {
-            Reply::Ok(_) => {}
-            Reply::Err(err) => {
-                anyhow::bail!("Failed to request event stream: {}", err);
-            }
-        }
-
-        Ok(socket)
     }
 }
