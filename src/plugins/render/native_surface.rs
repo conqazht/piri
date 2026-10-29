@@ -32,6 +32,8 @@ pub struct NativeRenderRequest {
     pub animation_t: f64,         // Animation progress 0.0-1.0, 0 = no animation
     pub animation_style: String,  // "pulse" | "fade"
     pub animation_amplitude: f64, // 0.0-1.0
+    pub animation_duration_ms: f64,
+    pub animation_repeat: u32,
 }
 
 struct EdgeSurface {
@@ -513,6 +515,13 @@ fn apply_request(
 
     // Handle animation request: update state and (re)start if needed
     if req.animation_t >= 0.0 {
+        state.animation_duration_ms = if req.animation_duration_ms > 0.0 {
+            req.animation_duration_ms
+        } else {
+            600.0
+        };
+        state.animation_repeat_max = req.animation_repeat;
+
         // Create timerfd if needed
         if state.animation_timerfd.is_none() {
             match create_timerfd() {

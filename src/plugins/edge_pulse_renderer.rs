@@ -65,6 +65,8 @@ impl EdgePulseRenderer {
             animation_t,
             animation_style: config.animation_style.clone(),
             animation_amplitude: config.animation_amplitude,
+            animation_duration_ms: config.animation_duration,
+            animation_repeat: config.animation_repeat,
         })
     }
 
