@@ -4,7 +4,29 @@ use crate::config::EdgePulseConfig;
 use crate::plugins::render::dual_edge_layer::{
     DualEdgeLayerRenderer, DualEdgeRenderRequest, EdgeGeometry, EdgeGradientStyle, EdgeVisibility,
 };
-use crate::plugins::render::gradient::rgb_from_hex;
+use crate::plugins::render::gradient::{rgb_from_hex, RgbColor};
+
+// Default fallback colors (matching #68d8ff, #1f4fff, #ffd36a, #ff7a1f)
+const DEFAULT_LEFT_START: RgbColor = RgbColor {
+    r: 104.0 / 255.0,
+    g: 216.0 / 255.0,
+    b: 1.0,
+};
+const DEFAULT_LEFT_END: RgbColor = RgbColor {
+    r: 31.0 / 255.0,
+    g: 79.0 / 255.0,
+    b: 1.0,
+};
+const DEFAULT_RIGHT_START: RgbColor = RgbColor {
+    r: 1.0,
+    g: 211.0 / 255.0,
+    b: 106.0 / 255.0,
+};
+const DEFAULT_RIGHT_END: RgbColor = RgbColor {
+    r: 1.0,
+    g: 122.0 / 255.0,
+    b: 31.0 / 255.0,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgePulseRenderState {
@@ -41,6 +63,35 @@ impl EdgePulseRenderer {
         } else {
             -1.0 // disables animation
         };
+        let left_start = rgb_from_hex(&config.left_gradient_start).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid left_gradient_start hex '{}', using default #68d8ff",
+                config.left_gradient_start
+            );
+            DEFAULT_LEFT_START
+        });
+        let left_end = rgb_from_hex(&config.left_gradient_end).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid left_gradient_end hex '{}', using default #1f4fff",
+                config.left_gradient_end
+            );
+            DEFAULT_LEFT_END
+        });
+        let right_start = rgb_from_hex(&config.right_gradient_start).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid right_gradient_start hex '{}', using default #ffd36a",
+                config.right_gradient_start
+            );
+            DEFAULT_RIGHT_START
+        });
+        let right_end = rgb_from_hex(&config.right_gradient_end).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid right_gradient_end hex '{}', using default #ff7a1f",
+                config.right_gradient_end
+            );
+            DEFAULT_RIGHT_END
+        });
+
         self.inner.render(DualEdgeRenderRequest {
             visibility: EdgeVisibility {
                 left: state.show_left,
@@ -51,13 +102,13 @@ impl EdgePulseRenderer {
                 height_ratio: config.height_ratio.clamp(0.0, 1.0),
             },
             left_style: EdgeGradientStyle {
-                start: rgb_from_hex(&config.left_gradient_start).unwrap(),
-                end: rgb_from_hex(&config.left_gradient_end).unwrap(),
+                start: left_start,
+                end: left_end,
                 base_alpha: config.alpha.clamp(0.0, 1.0),
             },
             right_style: EdgeGradientStyle {
-                start: rgb_from_hex(&config.right_gradient_start).unwrap(),
-                end: rgb_from_hex(&config.right_gradient_end).unwrap(),
+                start: right_start,
+                end: right_end,
                 base_alpha: config.alpha.clamp(0.0, 1.0),
             },
             target_output: target_output.map(|s| s.to_string()),

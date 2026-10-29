@@ -92,7 +92,7 @@ impl NativeSurfaceRenderer {
         self.ensure_started();
 
         // Check if the renderer thread reported an error
-        if let Some(err) = self.thread_error.lock().unwrap().as_ref() {
+        if let Some(err) = self.thread_error.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             self.tx = None;
             anyhow::bail!("Native Wayland renderer failed: {}", err);
         }
@@ -132,7 +132,7 @@ impl NativeSurfaceRenderer {
             return;
         }
 
-        *self.thread_error.lock().unwrap() = None;
+        *self.thread_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let error_sink = Arc::clone(&self.thread_error);
 
         // Create eventfd for waking up the event loop
@@ -168,13 +168,13 @@ impl NativeSurfaceRenderer {
                     if let Err(e) = event_loop(&conn, &mut event_queue, state, rx, eventfd_read) {
                         let msg = format!("{:#}", e);
                         log::error!("Native Wayland renderer error: {}", msg);
-                        *error_sink.lock().unwrap() = Some(msg);
+                        *error_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
                     }
                 }
                 Err(e) => {
                     let msg = format!("{:#}", e);
                     log::error!("Native Wayland renderer init error: {}", msg);
-                    *error_sink.lock().unwrap() = Some(msg);
+                    *error_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
                     let _ = init_tx.send(Err(e));
                 }
             }
@@ -337,9 +337,17 @@ fn event_loop(
     let qh = event_queue.handle();
 
     // Clone globals from the initialized state
-    let compositor = state.compositor.as_ref().unwrap().clone();
-    let shm = state.shm.as_ref().unwrap().clone();
-    let layer_shell = state.layer_shell.as_ref().unwrap().clone();
+    let compositor = state
+        .compositor
+        .as_ref()
+        .context("Compositor global unavailable in event loop")?
+        .clone();
+    let shm = state.shm.as_ref().context("Shm global unavailable in event loop")?.clone();
+    let layer_shell = state
+        .layer_shell
+        .as_ref()
+        .context("Layer shell global unavailable in event loop")?
+        .clone();
 
     let wl_fd = conn.as_fd().as_raw_fd();
     let event_fd = notify_fd.as_raw_fd();
@@ -414,7 +422,9 @@ fn event_loop(
             // timerfd triggered: animation frame tick
             if let Some(idx) = timerfd_idx {
                 if fds_vec[idx as usize].revents & libc::POLLIN != 0 {
-                    clear_timerfd(state.animation_timerfd.as_ref().unwrap());
+                    if let Some(ref tfd) = state.animation_timerfd {
+                        clear_timerfd(tfd);
+                    }
                     handle_animation_frame(&mut state, &compositor, &shm, &qh)?;
                     continue;
                 }
@@ -708,10 +718,12 @@ fn render_to_surface(
     let w = req.width.max(1);
     let h = req.height.max(1);
 
-    let edge = if is_left {
-        state.left.as_mut().unwrap()
+    let Some(ref mut edge) = (if is_left {
+        state.left.as_mut()
     } else {
-        state.right.as_mut().unwrap()
+        state.right.as_mut()
+    }) else {
+        return Ok(());
     };
 
     // Create buffer on first render
@@ -733,8 +745,10 @@ fn render_to_surface(
 
     // Render gradient into pixel buffer
     {
-        let data_arc = edge.data.as_ref().unwrap();
-        let mut buf = data_arc.lock().unwrap();
+        let Some(data_arc) = edge.data.as_ref() else {
+            return Ok(());
+        };
+        let mut buf = data_arc.lock().unwrap_or_else(|e| e.into_inner());
         if is_left {
             render_gradient(
                 &mut buf,
@@ -747,7 +761,7 @@ fn render_to_surface(
                 req.animation_t,
                 &req.animation_style,
                 req.animation_amplitude,
-            );
+            )?;
         } else {
             render_gradient(
                 &mut buf,
@@ -760,14 +774,18 @@ fn render_to_surface(
                 req.animation_t,
                 &req.animation_style,
                 req.animation_amplitude,
-            );
+            )?;
         }
-        write_buffer(edge._fd.as_ref().unwrap(), &buf);
+        if let Some(fd) = edge._fd.as_ref() {
+            write_buffer(fd, &buf);
+        }
     }
 
-    edge.wl_surface.attach(Some(edge.buffer.as_ref().unwrap()), 0, 0);
-    edge.wl_surface.damage(0, 0, w, h);
-    edge.wl_surface.commit();
+    if let Some(buffer) = edge.buffer.as_ref() {
+        edge.wl_surface.attach(Some(buffer), 0, 0);
+        edge.wl_surface.damage(0, 0, w, h);
+        edge.wl_surface.commit();
+    }
 
     Ok(())
 }
@@ -784,7 +802,7 @@ fn render_gradient(
     t: f64,
     style: &str,
     amplitude: f64,
-) {
+) -> Result<()> {
     // Clear all pixels to transparent
     pixels.fill(0);
 
@@ -812,10 +830,10 @@ fn render_gradient(
     };
 
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
-        .expect("Failed to create cairo surface");
+        .context("Failed to create cairo surface")?;
 
     {
-        let cr = cairo::Context::new(&surface).expect("Failed to create cairo context");
+        let cr = cairo::Context::new(&surface).context("Failed to create cairo context")?;
 
         // Clear to fully transparent
         cr.set_operator(cairo::Operator::Source);
@@ -870,9 +888,9 @@ fn render_gradient(
 
         // Intermediate surface: color × horizontal alpha
         let tmp = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
-            .expect("Failed to create tmp surface");
+            .context("Failed to create tmp surface")?;
         {
-            let tmp_cr = cairo::Context::new(&tmp).expect("Failed to create tmp context");
+            let tmp_cr = cairo::Context::new(&tmp).context("Failed to create tmp context")?;
             tmp_cr.set_operator(cairo::Operator::Source);
             tmp_cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
             tmp_cr.paint().ok();
@@ -894,12 +912,15 @@ fn render_gradient(
     // Copy pixel data from cairo surface to the output buffer
     let src_stride = surface.stride() as usize;
     let dst_stride = (width as usize) * 4;
-    let src_data = surface.data().expect("Failed to access cairo surface data");
+    let src_data = surface
+        .data()
+        .map_err(|e| anyhow::anyhow!("Failed to access cairo surface data: {:?}", e))?;
     for y in 0..height as usize {
         let src_row = &src_data[y * src_stride..y * src_stride + dst_stride];
         let dst_row = &mut pixels[y * dst_stride..y * dst_stride + dst_stride];
         dst_row.copy_from_slice(src_row);
     }
+    Ok(())
 }
 
 fn write_buffer(fd: &OwnedFd, data: &[u8]) {
@@ -1086,24 +1107,25 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
         if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
             surface.ack_configure(serial);
 
-            let shm = state.shm.as_ref().unwrap().clone();
+            let Some(shm) = state.shm.clone() else {
+                return;
+            };
 
             // Check left surface
-            if let Some(ref left) = state.left {
+            if let Some(ref mut left) = state.left {
                 if &left.surface == surface {
                     if !left.configured {
                         // Mark configured
-                        state.left.as_mut().unwrap().configured = true;
+                        left.configured = true;
                         // Process pending render if any
                         if let Some(req) = state.pending_left.take() {
                             if let Err(e) = render_to_surface(state, &shm, qh, &req, true) {
                                 log::error!("Deferred left render failed: {:#}", e);
                             }
                         }
-                    } else if state.left.as_ref().unwrap().buffer.is_some() {
+                    } else if let Some(ref buffer) = left.buffer {
                         // Re-attach on resize configure
-                        let left = state.left.as_ref().unwrap();
-                        left.wl_surface.attach(Some(left.buffer.as_ref().unwrap()), 0, 0);
+                        left.wl_surface.attach(Some(buffer), 0, 0);
                         left.wl_surface.commit();
                     }
                     return;
@@ -1111,18 +1133,17 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for AppState {
             }
 
             // Check right surface
-            if let Some(ref right) = state.right {
+            if let Some(ref mut right) = state.right {
                 if &right.surface == surface {
                     if !right.configured {
-                        state.right.as_mut().unwrap().configured = true;
+                        right.configured = true;
                         if let Some(req) = state.pending_right.take() {
                             if let Err(e) = render_to_surface(state, &shm, qh, &req, false) {
                                 log::error!("Deferred right render failed: {:#}", e);
                             }
                         }
-                    } else if state.right.as_ref().unwrap().buffer.is_some() {
-                        let right = state.right.as_ref().unwrap();
-                        right.wl_surface.attach(Some(right.buffer.as_ref().unwrap()), 0, 0);
+                    } else if let Some(ref buffer) = right.buffer {
+                        right.wl_surface.attach(Some(buffer), 0, 0);
                         right.wl_surface.commit();
                     }
                 }

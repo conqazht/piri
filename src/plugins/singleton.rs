@@ -121,7 +121,10 @@ impl SingletonManager {
             window.id
         };
 
-        let state = self.states.get_mut(name).unwrap();
+        let state = self
+            .states
+            .get_mut(name)
+            .with_context(|| format!("Singleton state '{}' not found in configuration", name))?;
         state.window_id = Some(window_id);
         Ok(window_id)
     }

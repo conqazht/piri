@@ -24,7 +24,10 @@ fn sticky_registry() -> &'static StdMutex<HashMap<u64, bool>> {
 /// Register a window as sticky. Called by scratchpads when creating a sticky
 /// scratchpad, or by sticky plugin via IPC.
 pub fn register_sticky_window(window_id: u64, cross_monitor: bool) {
-    sticky_registry().lock().unwrap().insert(window_id, cross_monitor);
+    sticky_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(window_id, cross_monitor);
     debug!(
         "Sticky registry: registered window {} (cross={})",
         window_id, cross_monitor
@@ -33,7 +36,7 @@ pub fn register_sticky_window(window_id: u64, cross_monitor: bool) {
 
 /// Unregister a sticky window.
 pub fn unregister_sticky_window(window_id: u64) {
-    sticky_registry().lock().unwrap().remove(&window_id);
+    sticky_registry().lock().unwrap_or_else(|e| e.into_inner()).remove(&window_id);
     debug!("Sticky registry: unregistered window {}", window_id);
 }
 
@@ -41,7 +44,7 @@ pub fn unregister_sticky_window(window_id: u64) {
 pub fn get_sticky_window_list() -> Vec<(u64, bool)> {
     sticky_registry()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|(&id, &cross)| (id, cross))
         .collect()
@@ -63,7 +66,7 @@ fn get_programmatic_focus_time() -> &'static StdMutex<Option<Instant>> {
 /// Focus changes within PROGRAMMATIC_FOCUS_WINDOW_MS will be ignored by window_rule
 pub fn mark_programmatic_focus_start() {
     let time = get_programmatic_focus_time();
-    let mut guard = time.lock().unwrap();
+    let mut guard = time.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(Instant::now());
 }
 
@@ -71,7 +74,7 @@ pub fn mark_programmatic_focus_start() {
 pub fn should_ignore_focus_change() -> bool {
     const PROGRAMMATIC_FOCUS_WINDOW_MS: u64 = 500;
     let time = get_programmatic_focus_time();
-    let guard = time.lock().unwrap();
+    let guard = time.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(start_time) = *guard {
         if start_time.elapsed().as_millis() < PROGRAMMATIC_FOCUS_WINDOW_MS as u128 {
             return true;
@@ -260,7 +263,7 @@ impl WindowMatcherCache {
     /// Get or compile a regex pattern (with caching)
     fn get_regex(&self, pattern: &str) -> Result<Arc<Regex>> {
         {
-            let cache = self.regex_cache.lock().unwrap();
+            let cache = self.regex_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(regex) = cache.get(pattern) {
                 return Ok(Arc::clone(regex));
             }
@@ -274,7 +277,7 @@ impl WindowMatcherCache {
                 .build()
                 .with_context(|| format!("Failed to compile regex pattern: {}", pattern))?,
         );
-        let mut cache = self.regex_cache.lock().unwrap();
+        let mut cache = self.regex_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Double-check after re-acquiring lock (another thread may have inserted)
         if let Some(existing) = cache.get(pattern) {
             return Ok(Arc::clone(existing));
@@ -326,7 +329,7 @@ impl WindowMatcherCache {
 
     /// Clear the regex cache (useful when config changes)
     pub fn clear_cache(&self) {
-        let mut cache = self.regex_cache.lock().unwrap();
+        let mut cache = self.regex_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
     }
 }

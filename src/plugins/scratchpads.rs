@@ -473,7 +473,10 @@ impl ScratchpadManager {
         if is_newly_launched {
             self.setup_window(window_id, &config).await?;
         }
-        let state = self.states.get_mut(name).unwrap();
+        let state = self
+            .states
+            .get_mut(name)
+            .with_context(|| format!("Scratchpad state '{}' not found", name))?;
         state.window_id = Some(window_id);
 
         // Delegate sticky behavior to the sticky plugin via global registry
@@ -511,7 +514,10 @@ impl ScratchpadManager {
 
         // 3. Resolve target workspace and tiling preference
         let (target_workspace, should_tile) = {
-            let state = self.states.get(name).unwrap();
+            let state = self
+                .states
+                .get(name)
+                .with_context(|| format!("Scratchpad state '{}' not found", name))?;
             let tw = state
                 .config
                 .move_to_workspace
@@ -553,7 +559,10 @@ impl ScratchpadManager {
                 self.niri.set_window_floating(window_id, false).await?;
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                let state = self.states.get_mut(name).unwrap();
+                let state = self
+                    .states
+                    .get_mut(name)
+                    .with_context(|| format!("Scratchpad state '{}' not found", name))?;
                 state.is_visible = false;
                 // Only save previous_focused_window if it was on current_workspace
                 let prev_in_current_ws = initially_focused.filter(|&id| {
@@ -575,7 +584,10 @@ impl ScratchpadManager {
             self.niri.set_window_floating(window_id, false).await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let state = self.states.get_mut(name).unwrap();
+            let state = self
+                .states
+                .get_mut(name)
+                .with_context(|| format!("Scratchpad state '{}' not found", name))?;
             state.is_visible = false;
 
             if initially_focused == Some(window_id) {
@@ -614,7 +626,10 @@ impl ScratchpadManager {
         let scratchpad_window_ids: Vec<u64> =
             self.states.values().filter_map(|s| s.window_id).collect();
 
-        let state = self.states.get_mut(name).unwrap();
+        let state = self
+            .states
+            .get_mut(name)
+            .with_context(|| format!("Scratchpad state '{}' not found", name))?;
 
         if state.is_visible {
             if window_in_current_ws {
@@ -740,7 +755,9 @@ impl ScratchpadManager {
         for name in names_to_hide {
             info!("Auto-hiding scratchpad '{}' due to focus loss", name);
             let (target_ws, should_tile) = {
-                let state = self.states.get_mut(&name).unwrap();
+                let Some(state) = self.states.get_mut(&name) else {
+                    continue;
+                };
                 state.is_visible = false;
                 state.previous_focused_window = None;
                 let tw =

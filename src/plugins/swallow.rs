@@ -502,19 +502,23 @@ impl SwallowPlugin {
             return Ok(());
         };
 
-        let should_restore = {
-            let entry = self.pending_column_restores.get_mut(&key).unwrap();
+        let should_restore = if let Some(entry) = self.pending_column_restores.get_mut(&key) {
             entry.child_ids.retain(|&id| id != window_id);
             entry.child_ids.is_empty()
+        } else {
+            false
         };
         if !should_restore {
             // Other swallowed children are still open in this column.
             return Ok(());
         }
 
-        let PendingColumnRestore {
+        let Some(PendingColumnRestore {
             parent_id, display, ..
-        } = self.pending_column_restores.remove(&key).unwrap();
+        }) = self.pending_column_restores.remove(&key)
+        else {
+            return Ok(());
+        };
 
         // The parent window selects the column; if it is gone there is nothing to restore.
         let windows = self.niri.get_windows_raw().await?;

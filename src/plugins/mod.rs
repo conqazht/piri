@@ -48,6 +48,7 @@ fn extract_display_prefix(output: &str) -> Option<&str> {
 
 /// Plugin trait that all plugins must implement
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait Plugin: Send + Sync {
     type Config: Clone + Send + Sync + FromConfig;
 

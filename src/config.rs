@@ -389,7 +389,27 @@ impl Config {
         let config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {:?}", path))?;
 
+        config
+            .validate()
+            .with_context(|| format!("Config validation error in {:?}", path))?;
+
         Ok(config)
+    }
+
+    /// Validate configuration invariants
+    pub fn validate(&self) -> Result<()> {
+        self.piri
+            .workspace_rule
+            .edge_pulse
+            .validate()
+            .context("In [piri.workspace_rule.edge_pulse]")?;
+        for (ws_name, ws_rule) in &self.workspace_rule {
+            ws_rule
+                .edge_pulse
+                .validate()
+                .with_context(|| format!("In [workspace_rule.{}.edge_pulse]", ws_name))?;
+        }
+        Ok(())
     }
 }
 
@@ -545,6 +565,31 @@ pub struct EdgePulseConfig {
     /// Number of animation repeats (0 = infinite loop until state changes).
     #[serde(default = "default_animation_repeat")]
     pub animation_repeat: u32,
+}
+
+fn validate_hex_color(hex: &str, field_name: &str) -> Result<()> {
+    let s = hex.trim();
+    let s = s.strip_prefix('#').ok_or_else(|| {
+        anyhow::anyhow!("Field '{}' must start with '#', got '{}'", field_name, hex)
+    })?;
+    if s.len() != 6 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "Field '{}' must be a valid 6-character hex color (e.g. #68d8ff), got '{}'",
+            field_name,
+            hex
+        );
+    }
+    Ok(())
+}
+
+impl EdgePulseConfig {
+    pub fn validate(&self) -> Result<()> {
+        validate_hex_color(&self.left_gradient_start, "left_gradient_start")?;
+        validate_hex_color(&self.left_gradient_end, "left_gradient_end")?;
+        validate_hex_color(&self.right_gradient_start, "right_gradient_start")?;
+        validate_hex_color(&self.right_gradient_end, "right_gradient_end")?;
+        Ok(())
+    }
 }
 
 impl Default for EdgePulseConfig {
@@ -750,16 +795,16 @@ mod tests {
     #[test]
     fn test_plugins_config_default() {
         let config: PluginsConfig = toml::from_str("").unwrap();
-        assert_eq!(config.is_enabled("scratchpads"), false);
-        assert_eq!(config.is_enabled("empty"), false);
-        assert_eq!(config.is_enabled("window_rule"), false);
-        assert_eq!(config.is_enabled("singleton"), false);
-        assert_eq!(config.is_enabled("window_order"), false);
-        assert_eq!(config.is_enabled("swallow"), false);
-        assert_eq!(config.is_enabled("workspace_rule"), false);
-        assert_eq!(config.is_enabled("mark"), false);
-        assert_eq!(config.is_enabled("sticky"), false);
-        assert_eq!(config.is_enabled("unknown_plugin"), false);
+        assert!(!config.is_enabled("scratchpads"));
+        assert!(!config.is_enabled("empty"));
+        assert!(!config.is_enabled("window_rule"));
+        assert!(!config.is_enabled("singleton"));
+        assert!(!config.is_enabled("window_order"));
+        assert!(!config.is_enabled("swallow"));
+        assert!(!config.is_enabled("workspace_rule"));
+        assert!(!config.is_enabled("mark"));
+        assert!(!config.is_enabled("sticky"));
+        assert!(!config.is_enabled("unknown_plugin"));
     }
 
     #[test]
@@ -1202,6 +1247,7 @@ auto_maximize = true
     #[test]
     fn test_edge_pulse_config_default() {
         let config: EdgePulseConfig = toml::from_str("").unwrap();
+        assert!(config.validate().is_ok());
         assert!(!config.enabled);
         assert!(config.show_left);
         assert!(config.show_right);
@@ -1217,6 +1263,17 @@ auto_maximize = true
         assert!((config.animation_duration - 600.0).abs() < f64::EPSILON);
         assert!((config.animation_amplitude - 0.8).abs() < f64::EPSILON);
         assert_eq!(config.animation_repeat, 3);
+    }
+
+    #[test]
+    fn test_edge_pulse_config_invalid_hex() {
+        let toml = r#"left_gradient_start = "invalid""#;
+        let config: EdgePulseConfig = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_err());
+
+        let toml_no_hash = r#"left_gradient_start = "68d8ff""#;
+        let config: EdgePulseConfig = toml::from_str(toml_no_hash).unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
