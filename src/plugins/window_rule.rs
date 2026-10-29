@@ -308,12 +308,12 @@ impl WindowRulePlugin {
         window_id: u64,
         width: Option<u32>,
         height: Option<u32>,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::niri::Window>> {
         const GAP: f64 = 16.0;
         let windows = niri.get_windows().await?;
         let me = match windows.iter().find(|w| w.id == window_id) {
             Some(w) => w,
-            None => return Ok(()),
+            None => return Ok(windows),
         };
         let ws_id = me.workspace_id;
         let mut siblings: Vec<(f64, f64, f64, f64)> = Vec::new();
@@ -335,10 +335,10 @@ impl WindowRulePlugin {
             }
         }
         if siblings.is_empty() {
-            return Ok(());
+            return Ok(windows);
         }
         let Some((cx, cy, cw, ch)) = niri.get_window_position(window_id).await? else {
-            return Ok(());
+            return Ok(windows);
         };
         let pw = width.map(|w| (w as f64).max(cw as f64)).unwrap_or(cw as f64);
         let ph = height.map(|h| (h as f64).max(ch as f64)).unwrap_or(ch as f64);
@@ -402,7 +402,7 @@ impl WindowRulePlugin {
         if dx != 0 {
             niri.move_window_relative(window_id, dx, 0).await?;
         }
-        Ok(())
+        Ok(windows)
     }
 
     /// Row-arrange rule-managed panels on this window's workspace.
@@ -468,10 +468,13 @@ impl WindowRulePlugin {
                     }
                     if action.should_center() {
                         let _ = niri.center_window(window_id).await;
-                        let _ = Self::avoid_overlap(&niri, window_id, action.width, action.height)
-                            .await;
                     }
-                    if let Ok(windows) = niri.get_windows().await {
+                    let windows = if action.should_center() {
+                        Self::avoid_overlap(&niri, window_id, action.width, action.height).await
+                    } else {
+                        niri.get_windows().await
+                    };
+                    if let Ok(windows) = windows {
                         if let Some(ws_id) =
                             windows.iter().find(|w| w.id == window_id).and_then(|w| w.workspace_id)
                         {

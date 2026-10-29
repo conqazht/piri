@@ -458,17 +458,27 @@ impl WorkspaceRulePlugin {
     }
 
     /// Apply width adjustments to windows in current workspace
-    /// The logic is based on column count, not window count (a column may have multiple windows)
+    /// Wrapper for general callers: fetches focused workspace and raw windows
     async fn apply_widths(&mut self) -> Result<()> {
         let current_ws = self.niri.get_focused_workspace().await?;
+        let windows = self.niri.get_windows_raw().await?;
+        self.apply_widths_for_workspace(&current_ws, &windows).await
+    }
+
+    /// Apply width adjustments to windows in a given workspace using provided windows snapshot
+    /// The logic is based on column count, not window count (a column may have multiple windows)
+    async fn apply_widths_for_workspace(
+        &mut self,
+        current_ws: &crate::niri::Workspace,
+        windows: &[crate::niri::Window],
+    ) -> Result<()> {
         let ws_idx = current_ws.idx;
         let ws_name = &current_ws.name;
         let ws_output = current_ws.output.as_deref();
         let ws_id = current_ws.id;
-        let windows = self.niri.get_windows().await?;
 
         // 1. Filter tiled windows in current workspace
-        let ws_windows = Self::filter_tiled_windows_in_workspace(&windows, ws_id);
+        let ws_windows = Self::filter_tiled_windows_in_workspace(windows, ws_id);
 
         // 2. Group windows by column (one window ID per column is enough)
         // Calculate columns early for use throughout the function
@@ -957,14 +967,15 @@ impl WorkspaceRulePlugin {
         }
 
         debug!("Window {} closed, applying width adjustments", window_id);
-        self.apply_widths().await?;
-
         let current_ws = self.niri.get_focused_workspace().await?;
+        let remaining = self.niri.get_windows_raw().await?;
+
+        self.apply_widths_for_workspace(&current_ws, &remaining).await?;
+
         let ws_idx = current_ws.idx;
         let ws_name = &current_ws.name;
         let ws_output = current_ws.output.as_deref();
 
-        let remaining = self.niri.get_windows_raw().await.unwrap_or_default();
         for w in &remaining {
             if !w.floating {
                 if let (Some(ws_id), Some(layout)) = (w.workspace_id, &w.layout) {
