@@ -189,6 +189,73 @@ impl NiriIpc {
         Ok(())
     }
 
+    /// Send a raw JSON IPC request to niri and parse the reply.
+    pub async fn send_raw_request(&self, payload: &str) -> Result<Reply> {
+        let socket_path = self.get_socket_path()?;
+        let payload = payload.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Reply> {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixStream;
+
+            let mut stream =
+                UnixStream::connect(&socket_path).context("Failed to connect to niri socket")?;
+            stream
+                .write_all(payload.as_bytes())
+                .context("Failed to write raw request to niri socket")?;
+            if !payload.ends_with('\n') {
+                stream.write_all(b"\n").context("Failed to write newline to niri socket")?;
+            }
+
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).context("Failed to read reply from niri socket")?;
+            let reply: Reply =
+                serde_json::from_str(&line).context("Failed to parse niri IPC reply")?;
+            Ok(reply)
+        })
+        .await
+        .context("Task join error")?
+    }
+
+    /// Set or unset maximized-to-edges state on a window.
+    /// Falls back to `MaximizeWindowToEdges` toggle if the running compositor does not support
+    /// `SetWindowMaximizedToEdges` / `UnsetWindowMaximizedToEdges` yet.
+    pub async fn set_window_maximized_to_edges(
+        &self,
+        window_id: u64,
+        maximized: bool,
+    ) -> Result<()> {
+        let action_name = if maximized {
+            "SetWindowMaximizedToEdges"
+        } else {
+            "UnsetWindowMaximizedToEdges"
+        };
+        let payload = serde_json::json!({
+            "Action": {
+                action_name: {
+                    "id": window_id
+                }
+            }
+        })
+        .to_string();
+
+        match self.send_raw_request(&payload).await? {
+            Reply::Ok(_) => Ok(()),
+            Reply::Err(err) if err.contains("error parsing request") => {
+                log::debug!(
+                    "Compositor does not support {}, falling back to MaximizeWindowToEdges: {}",
+                    action_name,
+                    err
+                );
+                self.send_action(Action::MaximizeWindowToEdges {
+                    id: Some(window_id),
+                })
+                .await
+            }
+            Reply::Err(err) => anyhow::bail!("niri-ipc error: {}", err),
+        }
+    }
+
     /// Execute multiple IPC operations in a single blocking task to minimize latency
     /// and ensure they are processed sequentially without gaps.
     pub async fn execute_batch<F, T>(&self, f: F) -> Result<T>

@@ -514,9 +514,7 @@ impl WorkspaceRulePlugin {
                     );
 
                     self.niri
-                        .send_action(Action::MaximizeWindowToEdges {
-                            id: Some(window_id),
-                        })
+                        .set_window_maximized_to_edges(window_id, true)
                         .await
                         .map_err(|e| warn!("Failed to maximize window {}: {}", window_id, e))
                         .ok();
@@ -539,11 +537,8 @@ impl WorkspaceRulePlugin {
                                     "Auto-maximize: unmaximizing window {} (multiple windows, no auto_width)",
                                     window.id
                                 );
-                                // Cancel maximize by toggling (MaximizeWindowToEdges is a toggle)
                                 self.niri
-                                    .send_action(Action::MaximizeWindowToEdges {
-                                        id: Some(window.id),
-                                    })
+                                    .set_window_maximized_to_edges(window.id, false)
                                     .await
                                     .map_err(|e| {
                                         warn!("Failed to unmaximize window {}: {}", window.id, e)
